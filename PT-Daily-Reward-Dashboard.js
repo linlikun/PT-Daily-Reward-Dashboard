@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PT Daily Reward Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      10.1.0 (Resource Split)
+// @version      10.2.0 (Merge)
 // @description  多站点 PT 每日奖励控制面板；支持同站点多活动连续领取；极速后台静默领取；多特殊转盘支持
 // @author       Whale, DeepSeek
 // @license      GPL-3.0 License
@@ -89,7 +89,7 @@
 // ==/UserScript==
 
 /*
- * 结构说明（V10.1.0）
+ * 结构说明（V10.2.0：合并重复函数，行为与 10.1.0 一致）
  *   0. 资源层   —— CSS / 面板模板 / 站点表 / 时区表全部来自 @resource
  *   1. 常量层   —— 时间、存储键、TTL
  *   2. 日志层   —— 持久化日志 + 网络 hook
@@ -231,9 +231,19 @@ const STATUS_LABELS = {
     maintenance: '🚧 维护中',
 };
 const TERMINAL_STATUSES = ['claimed', 'already', 'failed', 'skip', 'auth', 'timeout', 'empty', 'available', 'notopen', 'maintenance'];
-const DONE_STATUSES     = ['claimed', 'already', 'empty', 'failed', 'skip', 'auth', 'timeout', 'maintenance', 'notopen'];
+/** 已落定结论（不含 available）；tab 轮询与收尾共用一份，取代原先两份手写列表 */
+const SETTLED_STATUSES  = TERMINAL_STATUSES.filter(s => s !== 'available');
 const FAIL_STATUSES     = ['failed', 'skip'];
 const isTerminal = st => TERMINAL_STATUSES.includes(st.status);
+const isSettled  = st => SETTLED_STATUSES.includes(st.status);
+
+/* ---- 结果构造器 ---- */
+const authResult   = (message = '会话已过期，需要重新登录') => ({ status: 'auth', message });
+const isNavigating = r => !!r && r.status === 'navigating';
+/** 未登录守卫：已登录返回 null */
+const loginGate = () => (isOnLoginPageNow() ? authResult() : null);
+/** 给领取 handler 套统一登录守卫，替代每个 handler 首行重复的那句判断 */
+const guardLogin = fn => async (...a) => loginGate() || fn(...a);
 
 /* ---- 站点能力表 ---- */
 const MULTI_TASK_SITES = new Set(['0dayfiles.net']);
@@ -417,6 +427,11 @@ function getSiteToday(host = HOST) {
 }
 const TODAY = getSiteToday(HOST);
 
+/* ---- 常用派生判定（原先多处重复同一算式） ---- */
+const attendanceDone = () => (Date.now() - GM_getValue(ATTENDANCE_LAST_CONFIRMED_KEY, 0)) < ATTENDANCE_COOLDOWN;
+const markAttendanceConfirmed = () => GM_setValue(ATTENDANCE_LAST_CONFIRMED_KEY, Date.now());
+const pumpkinDone = () => { const last = GM_getValue(PUMPKIN_LAST_CLAIM_KEY, 0); return !!last && Date.now() - last < PUMPKIN_COOLDOWN; };
+
 /* ---- 多活动 pending ---- */
 function setPendingEvents(host, paths) { GM_setValue(PENDING_EVENTS_PREFIX + host, { paths: [...paths], ts: Date.now() }); }
 function getPendingEvents(host) {
@@ -491,6 +506,10 @@ function getSiteStatus(host, suffix) {
 }
 const setPumpkinStatus = (status, message) => setSiteStatus(HOST, { status, message }, 'pumpkin');
 const getPumpkinStatus = () => getSiteStatus(HOST, 'pumpkin');
+
+const YUSCENE_WHEEL_OK = ['claimed', 'already', 'empty'];
+/** YuScene 转盘今日是否已出结果（24h 内） */
+const yusceneWheelDone = () => { const st = getSiteStatus('yu-scene.net'); return YUSCENE_WHEEL_OK.includes(st.status) && !!st.ts && Date.now() - st.ts < DAY; };
 
 /* ---- 失败计数 / 升降级 ---- */
 const getFailureCount = host => { const n = GM_getValue(FAILURE_KEY_PREFIX + host, 0); return typeof n === 'number' ? n : 0; };
@@ -696,6 +715,9 @@ const isMaintenancePage = html => {
 };
 const MAINTENANCE_TEXT_RE = /503\s*[-:]?\s*SERVICE UNAVAILABLE|MAINTENANCE|offline for scheduled maintenance|站点维护|维护中|back shortly/i;
 const isMaintenanceText = t => MAINTENANCE_TEXT_RE.test(t || '');
+/** 正文像维护页、且页面里没有指定业务组件时判定为维护 */
+const isMaintenanceBody = exceptSel => isMaintenanceText(document.body?.innerText || '')
+    && !(exceptSel && document.querySelector(exceptSel));
 const isOnLoginPageNow = () => /\/(login|auth|signin)/i.test(location.pathname)
     || !!(document.querySelector('input[name="password"]') && document.querySelector('input[name="username"]'));
 
@@ -706,6 +728,14 @@ function classifyHtml(html) {
     if (isMaintenancePage(html)) return { status: 'maintenance', message: '站点维护中' };
     if (looksLikeLoginPage(html)) return { status: 'auth', message: '会话已过期 (登录页)' };
     if (looksLikeCloudflareChallenge(html)) return { status: 'maintenance', message: '被 Cloudflare 拦截' };
+    return null;
+}
+
+/** HTTP 响应码 → 站点状态；正常响应返回 null（notFound=false 时不归类 404） */
+function httpStatusToResult(res, { auth = false, notFound = true } = {}) {
+    if (auth && (res.status === 401 || res.status === 403)) return { status: 'auth', message: `需要登录 (HTTP ${res.status})` };
+    if (notFound && res.status === 404) return { status: 'inactive', message: '该站无活动页面 (404)' };
+    if (res.status >= 500) return { status: 'maintenance', message: `服务器错误 (HTTP ${res.status})` };
     return null;
 }
 
@@ -726,6 +756,14 @@ const escapeHtml = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;'
 const escOrDash = s => s ? escapeHtml(s) : '<span class="msg empty">—</span>';
 const siteIconHtml = host => `<img class="site-icon" src="https://www.google.com/s2/favicons?domain=${encodeURIComponent(host)}&sz=32" alt="" loading="lazy" onerror="this.style.visibility='hidden'">`;
 
+/** 取 CSRF Token：meta 优先，Laravel 的 XSRF-TOKEN cookie 兜底 */
+function getCsrfToken() {
+    const meta = document.querySelector('meta[name="csrf-token"]');
+    if (meta && meta.content) return meta.content;
+    const m = document.cookie.match(/XSRF-TOKEN=([^;]+)/);
+    return m ? decodeURIComponent(m[1]) : '';
+}
+
 /* ---- 时间格式化（统一入口，替代原先 6 处重复写法） ---- */
 function fmtAgo(ts) {
     const age = Date.now() - ts;
@@ -737,6 +775,9 @@ function fmtAgo(ts) {
 const fmtNext = ts => new Date(ts).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
 const fmtClock = ts => new Date(ts).toLocaleString('zh-CN', { hour: '2-digit', minute: '2-digit' });
 const remainMin = ts => Math.ceil((ts - Date.now()) / MIN);
+/** 冷却提示文案（各站 handler 共用） */
+const cooldownText = (lastReward, nextTs, withMinutes = true) =>
+    `冷却中 · 上次：${lastReward} · 下次：${fmtNext(nextTs)}${withMinutes ? `（${remainMin(nextTs)} 分钟后）` : ''}`;
 
 function showToast(text) {
     if (!document.body) return;
@@ -1239,9 +1280,8 @@ async function probeRemoteSite(host) {
     catch (e) { return probeErrorToStatus(e); }
 
     if (res.redirected && /\/(login|auth|signin)/i.test(new URL(res.finalUrl).pathname)) return { status: 'auth', message: '会话已过期' };
-    if (res.status === 401 || res.status === 403) return { status: 'auth', message: `需要登录 (HTTP ${res.status})` };
-    if (res.status === 404) return { status: 'inactive', message: '该站无活动页面 (404)' };
-    if (res.status >= 500) return { status: 'maintenance', message: `服务器错误 (HTTP ${res.status})` };
+    const httpBad = httpStatusToResult(res, { auth: true });
+    if (httpBad) return httpBad;
     if (!res.ok) return { status: 'failed', message: `GET /events → HTTP ${res.status}` };
 
     const html = await res.text();
@@ -1350,8 +1390,8 @@ async function _autoDetectRewardPathInner() {
     catch (e) { return null; }
 
     if (looksLikeLoginResponse(res)) return { needLogin: true };
-    if (res.status === 404) return { status: 'inactive', message: '该站无活动页面 (404)' };
-    if (res.status >= 500) return { status: 'maintenance', message: `服务器错误 (HTTP ${res.status})` };
+    const httpBad = httpStatusToResult(res);
+    if (httpBad) return httpBad;
     if (!res.ok) return null;
 
     const html = await res.text();
@@ -1392,8 +1432,7 @@ const buildClaimUrl = (host, mode = 'claim') => {
     const hash = mode === 'detect' ? DETECT_HASH : CLAIM_HASH;
 
     if (host === '0dayfiles.net') {
-        const attendOk = (Date.now() - GM_getValue(ATTENDANCE_LAST_CONFIRMED_KEY, 0)) < ATTENDANCE_COOLDOWN;
-        return `https://0dayfiles.net/${attendOk ? 'spin-wheel' : 'attendance'}${hash}`;
+        return `https://0dayfiles.net/${attendanceDone() ? 'spin-wheel' : 'attendance'}${hash}`;
     }
 
     const cfg = ALL_KNOWN_SITES[host];
@@ -1407,11 +1446,44 @@ const buildClaimUrl = (host, mode = 'claim') => {
     return `https://${host}${path}${hash}`;
 };
 
+/** 路径守卫：不在目标页就跳转并返回 navigating，已在目标页返回 null（match 支持字符串/正则/谓词） */
+function ensurePath(match, path, { hash = location.hash || CLAIM_HASH } = {}) {
+    const p = location.pathname;
+    const onPath = typeof match === 'function' ? match(p)
+        : (match instanceof RegExp ? match.test(p) : p.includes(match));
+    if (onPath) return null;
+    location.href = location.origin + path + hash;
+    return { status: 'navigating' };
+}
+
 /* ==========================================================================
    7. 领取层
    ========================================================================== */
 
 /* ---- 7.1 Unit3D ---- */
+/** 等活动格子渲染出来（三个领取入口共用） */
+const waitForEventArticles = (timeout = 15000) =>
+    waitFor(() => document.querySelectorAll('article.events__prize').length > 0 || null, timeout, 200);
+
+/** 定位可点击的领取按钮；有未领取标记/领取表单但按钮不可用时返回 unclaimed-no-button */
+function locateClaimTarget() {
+    const unclaimed = document.querySelector(SEL_UNCLAIMED);
+    const scope = unclaimed
+        ? (unclaimed.closest('article.events__prize') || unclaimed.closest('.panelV2') || unclaimed.parentElement)
+        : null;
+    const form = scope?.querySelector('form[action*="/claims"]') || document.querySelector('form[action*="/claims"]');
+    const btn = form?.querySelector('button') || scope?.querySelector('button');
+    if (btn && !btn.disabled) return { type: 'button', button: btn, form };
+    return (unclaimed || form) ? { type: 'unclaimed-no-button' } : null;
+}
+
+/** autoDetectRewardPath 的返回值 → 需立即返回的状态（否则 null） */
+function detectedToResult(d) {
+    if (!d) return null;
+    if (d.needLogin) return authResult();
+    return ['maintenance', 'inactive', 'notopen'].includes(d.status) ? d : null;
+}
+
 async function navigateToUnit3DEventPage(cfg) {
     const hash = location.hash === DETECT_HASH ? DETECT_HASH : CLAIM_HASH;
     const base = location.origin;
@@ -1427,8 +1499,8 @@ async function navigateToUnit3DEventPage(cfg) {
     }
 
     const detected = await autoDetectRewardPath();
-    if (detected && detected.needLogin) return { status: 'auth', message: '会话已过期，需要重新登录' };
-    if (detected && ['maintenance', 'inactive', 'notopen'].includes(detected.status)) return detected;
+    const early = detectedToResult(detected);
+    if (early) return early;
     if (detected && detected.path) {
         setCachedEventPath(HOST, detected.path, detected.source || 'local');
         location.href = `${base}${detected.path}${hash}`;
@@ -1457,11 +1529,10 @@ async function finishUnit3DClaim(form, button) {
     return { status: 'navigating' };
 }
 
-async function claimUnit3DEventPage() {
-    if (isOnLoginPageNow()) return { status: 'auth', message: '会话已过期，需要重新登录' };
+const claimUnit3DEventPage = guardLogin(async () => {
     if (isMaintenancePage(document.documentElement.outerHTML)) return { status: 'maintenance', message: '站点维护中' };
 
-    await waitFor(() => document.querySelectorAll('article.events__prize').length > 0 || null, 15000, 200);
+    await waitForEventArticles();
 
     const todayArt = findTodayArticle();
     if (!todayArt) {
@@ -1480,24 +1551,10 @@ async function claimUnit3DEventPage() {
         return { status: 'notopen', message: `今日奖励尚未开放${msg ? `（${msg}）` : ''}` };
     }
 
-    const found = await waitFor(() => {
-        const unclaimed = document.querySelector(SEL_UNCLAIMED);
-        if (unclaimed) {
-            const article = unclaimed.closest('article.events__prize') || unclaimed.closest('.panelV2') || unclaimed.parentElement;
-            const form = article?.querySelector('form[action*="/claims"]') || document.querySelector('form[action*="/claims"]');
-            const btn = form?.querySelector('button') || article?.querySelector('button');
-            if (btn && !btn.disabled) return { type: 'button', button: btn, form };
-            return { type: 'unclaimed-no-button' };
-        }
-        const genericForm = document.querySelector('form[action*="/claims"]');
-        if (genericForm) {
-            const btn = genericForm.querySelector('button');
-            if (btn && !btn.disabled) return { type: 'button', button: btn, form: genericForm };
-            return { type: 'unclaimed-no-button' };
-        }
-        if (document.querySelector(SEL_CLAIMED)) return { type: 'no-unclaimed' };
-        return null;
-    }, WAIT_BUTTON_TIMEOUT);
+    const found = await waitFor(
+        () => locateClaimTarget() || (document.querySelector(SEL_CLAIMED) ? { type: 'no-unclaimed' } : null),
+        WAIT_BUTTON_TIMEOUT
+    );
 
     if (!found || found.type === 'no-unclaimed') {
         const rewardText = extractRewardText();
@@ -1507,8 +1564,8 @@ async function claimUnit3DEventPage() {
         if (!reprobeAttempted.has(HOST)) {
             reprobeAttempted.add(HOST);
             const detected = await autoDetectRewardPath();
-            if (detected && detected.needLogin) return { status: 'auth', message: '会话已过期，需要重新登录' };
-            if (detected && ['maintenance', 'inactive', 'notopen'].includes(detected.status)) return detected;
+            const early = detectedToResult(detected);
+            if (early) return early;
             if (detected && detected.path && detected.path !== location.pathname) {
                 setCachedEventPath(HOST, detected.path, detected.source || 'local');
                 location.href = location.origin + detected.path + (location.hash || CLAIM_HASH);
@@ -1520,12 +1577,11 @@ async function claimUnit3DEventPage() {
 
     if (found.type === 'unclaimed-no-button') {
         const resolved = await waitFor(() => {
-            const unclaimed = document.querySelector(SEL_UNCLAIMED);
-            if (!unclaimed) return document.querySelector(SEL_CLAIMED) ? { type: 'claimed' } : null;
-            const article = unclaimed.closest('article.events__prize') || unclaimed.closest('.panelV2') || unclaimed.parentElement;
-            const form = article?.querySelector('form[action*="/claims"]') || document.querySelector('form[action*="/claims"]');
-            const btn = form?.querySelector('button') || article?.querySelector('button');
-            return (btn && !btn.disabled) ? { type: 'button', button: btn, form } : null;
+            if (!document.querySelector(SEL_UNCLAIMED)) {
+                return document.querySelector(SEL_CLAIMED) ? { type: 'claimed' } : null;
+            }
+            const hit = locateClaimTarget();
+            return (hit && hit.type === 'button') ? hit : null;
         }, 8000, 200);
 
         if (resolved && resolved.type === 'claimed') {
@@ -1536,11 +1592,11 @@ async function claimUnit3DEventPage() {
     }
 
     return finishUnit3DClaim(found.form, found.button);
-}
+});
 
 /* ---- 7.2 多活动连续领取 ---- */
 async function handleMultiEventClaim() {
-    await waitFor(() => document.querySelectorAll('article.events__prize').length > 0 || null, 15000, 200);
+    await waitForEventArticles();
     await sleep(300);
 
     const unclaimed = document.querySelector(SEL_UNCLAIMED);
@@ -1592,8 +1648,9 @@ async function navigateToInfinityHDEventPage() {
         let res;
         try { res = await fetchWithTimeout(`${base}/`, { credentials: 'include' }, FETCH_TIMEOUT, 2); }
         catch (e) { return { status: 'failed', message: e.name === 'AbortError' ? '请求超时' : `网络错误：${e.message || e}` }; }
-        if (looksLikeLoginResponse(res)) return { status: 'auth', message: '会话已过期，需要重新登录' };
-        if (res.status >= 500) return { status: 'maintenance', message: `服务器错误 (HTTP ${res.status})` };
+        if (looksLikeLoginResponse(res)) return authResult();
+        const httpBad = httpStatusToResult(res, { notFound: false });
+        if (httpBad) return httpBad;
 
         const html = await res.text();
         const bad = classifyHtml(html);
@@ -1606,8 +1663,9 @@ async function navigateToInfinityHDEventPage() {
 }
 
 /* ---- 7.4 CZTeam ---- */
-async function claimOnCzTeam() {
-    if (isOnLoginPageNow()) return { status: 'auth', message: '会话已过期，需要重新登录' };
+const claimOnCzTeam = guardLogin(async () => {
+    const nav = ensurePath('events.php', '/events.php', { hash: '' });
+    if (nav) return nav;
     const h2 = document.querySelector('.gift-hero h2');
     if (h2 && /already opened/i.test(h2.textContent || '')) {
         return { status: 'already', message: buildCzMessage(gmGet(CZ_BALANCE_KEY, TTL_SNAPSHOT)) };
@@ -1630,7 +1688,7 @@ async function claimOnCzTeam() {
         return { status: 'navigating' };
     }
     return { status: 'skip', message: '未找到每日礼物按钮' };
-}
+});
 
 /* ---- 7.5 SeedCore ---- */
 async function handleSeedcoreBubble() {
@@ -1668,23 +1726,15 @@ async function handleSeedcoreBubble() {
     catch (e) { return { result: 'unavailable' }; }
 }
 
-async function claimOnSeedCore() {
-    if (isOnLoginPageNow()) return { status: 'auth', message: '会话已过期，需要重新登录' };
-
+const claimOnSeedCore = guardLogin(async () => {
     const bubble = await handleSeedcoreBubble();
     if (bubble.result === 'claimed') return { status: 'navigating' };
 
-    if (location.pathname === '/' || location.pathname === '') {
-        location.href = location.origin + '/events/2' + (location.hash || CLAIM_HASH);
-        return { status: 'navigating' };
-    }
+    /* 首页 → 活动页 2；其它非活动页 → 首页 */
+    const nav = ensurePath(p => p === '/' || p === '', '/events/2') || ensurePath(() => isOnEventPage(), '/');
+    if (nav) return nav;
 
-    if (!isOnEventPage()) {
-        location.href = location.origin + '/' + (location.hash || CLAIM_HASH);
-        return { status: 'navigating' };
-    }
-
-    await waitFor(() => document.querySelectorAll('article.events__prize').length > 0 || null, 15000, 200);
+    await waitForEventArticles();
     const unclaimed = document.querySelector(SEL_UNCLAIMED);
     if (!unclaimed) {
         const parts = [];
@@ -1704,15 +1754,12 @@ async function claimOnSeedCore() {
         catch (e) { return { status: 'failed', message: `提交日期表单失败：${e.message || e}` }; }
     }
     return { status: 'failed', message: '找到未领取标记但无按钮' };
-}
+});
 
 /* ---- 7.6 RetroToon ---- */
-async function claimOnRetroToon() {
-    if (isOnLoginPageNow()) return { status: 'auth', message: '会话已过期，需要重新登录' };
-    if (!location.pathname.includes('attendance.php')) {
-        location.href = location.origin + '/attendance.php';
-        return { status: 'navigating' };
-    }
+const claimOnRetroToon = guardLogin(async () => {
+    const nav = ensurePath('attendance.php', '/attendance.php', { hash: '' });
+    if (nav) return nav;
     await sleep(300);
     if (/[?&]claimed=1/.test(location.search)) {
         return { status: 'claimed', message: extractRetroToonReward() || '已成功领取每日奖励' };
@@ -1721,7 +1768,7 @@ async function claimOnRetroToon() {
     if (!claimBtn) return { status: 'already', message: extractRetroToonReward() || '今日已领取' };
     try { claimBtn.click(); return { status: 'navigating' }; }
     catch (e) { return { status: 'failed', message: `点击失败：${e.message || e}` }; }
-}
+});
 
 /* ---- 7.7 DigitalCore ---- */
 async function doDigitalCoreClaim() {
@@ -1759,8 +1806,7 @@ function parseDirtyBytesLastClaim(str) {
     const t = new Date(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}+08:00`);
     return isNaN(t.getTime()) ? null : t;
 }
-async function claimOnDirtyBytes() {
-    if (isOnLoginPageNow()) return { status: 'auth', message: '会话已过期，需要重新登录' };
+const claimOnDirtyBytes = guardLogin(async () => {
     try {
         const res = await fetchWithTimeout(`${DIRTYBYTES_ORIGIN}${DIRTYBYTES_API}`, { credentials: 'include' }, FETCH_TIMEOUT, 2);
         if (looksLikeLoginResponse(res)) return { status: 'auth', message: '会话已过期，需要重新登录' };
@@ -1777,16 +1823,14 @@ async function claimOnDirtyBytes() {
         }
         return { status: 'available', message: `待登录发放 · 连续 ${streak} 天 · 下次 +${nextPoints}p` };
     } catch (e) { return { status: 'failed', message: `异常：${e.message || e}` }; }
-}
+});
 
 /* ---- 7.9 0DayFiles：签到 + 转盘 ---- */
-async function claimOn0DayFilesAttendance() {
-    if (isOnLoginPageNow()) return { status: 'auth', message: '会话已过期，需要重新登录' };
-
+const claimOn0DayFilesAttendance = guardLogin(async () => {
     const storedReward = sessionStorage.getItem('pt_0df_attendance_reward');
     if (storedReward) {
         sessionStorage.removeItem('pt_0df_attendance_reward');
-        GM_setValue(ATTENDANCE_LAST_CONFIRMED_KEY, Date.now());
+        markAttendanceConfirmed();
         GM_setValue(ATTENDANCE_LAST_REWARD_KEY, storedReward);
         return { status: 'claimed', message: `本次签到：${storedReward}` };
     }
@@ -1795,7 +1839,7 @@ async function claimOn0DayFilesAttendance() {
     if (doneEl && doneEl.offsetParent !== null) {
         const streakMatch = doneEl.textContent.match(/Day\s*(\d+)/i);
         const msg = streakMatch ? `今日已签到 · 连续 ${streakMatch[1]} 天` : '今日已签到';
-        GM_setValue(ATTENDANCE_LAST_CONFIRMED_KEY, Date.now());
+        markAttendanceConfirmed();
 
         if (!GM_getValue(ATTENDANCE_LAST_REWARD_KEY, '')) {
             const todayCell = document.querySelector('.attendance-day--done.attendance-day--is-today') || document.querySelector('.attendance-day--is-today');
@@ -1811,7 +1855,7 @@ async function claimOn0DayFilesAttendance() {
     if (!btn) {
         const todayForm = document.querySelector('.attendance-today__form');
         if (!todayForm) {
-            GM_setValue(ATTENDANCE_LAST_CONFIRMED_KEY, Date.now());
+            markAttendanceConfirmed();
             return { status: 'already', message: '今日已签到' };
         }
         try {
@@ -1845,7 +1889,7 @@ async function claimOn0DayFilesAttendance() {
     }, 5000);
 
     if (result) {
-        GM_setValue(ATTENDANCE_LAST_CONFIRMED_KEY, Date.now());
+        markAttendanceConfirmed();
         if (rewardStr) GM_setValue(ATTENDANCE_LAST_REWARD_KEY, rewardStr);
         sessionStorage.removeItem('pt_0df_attendance_reward');
         return { status: 'claimed', message: rewardStr ? `本次签到：${rewardStr}` : '签到成功' };
@@ -1855,11 +1899,9 @@ async function claimOn0DayFilesAttendance() {
         return { status: 'claimed', message: `本次签到：${rewardStr}（刷新中）` };
     }
     return { status: 'timeout', message: '签到结果超时，请手动确认' };
-}
+});
 
-async function claimOn0DayFilesSpinWheel() {
-    if (isOnLoginPageNow()) return { status: 'auth', message: '会话已过期，需要重新登录' };
-
+const claimOn0DayFilesSpinWheel = guardLogin(async () => {
     const root = await waitFor(() => document.querySelector('[x-data^="spinWheel"]'), 5000);
     if (!root) return { status: 'skip', message: '未找到转盘组件（页面结构可能已变化）' };
 
@@ -1871,8 +1913,7 @@ async function claimOn0DayFilesSpinWheel() {
     if (nextSec && nextSec * 1000 > Date.now() + 30 * 1000) {
         const nextMs = nextSec * 1000;
         GM_setValue(SPINWHEEL_NEXT_KEY, nextMs);
-        const lastReward = GM_getValue(SPINWHEEL_LAST_REWARD_KEY, '未知');
-        return { status: 'already', message: `冷却中 · 上次：${lastReward} · 下次：${fmtNext(nextMs)}（${remainMin(nextMs)} 分钟后）` };
+        return { status: 'already', message: cooldownText(GM_getValue(SPINWHEEL_LAST_REWARD_KEY, '未知'), nextMs) };
     }
 
     const btn = document.querySelector('.sw-hub') || document.querySelector('form button.sw-btn');
@@ -1890,7 +1931,7 @@ async function claimOn0DayFilesSpinWheel() {
     const reward = result.nothing ? 'Nothing' : (result.label || '未知奖励');
     GM_setValue(SPINWHEEL_LAST_REWARD_KEY, reward);
     return { status: result.nothing ? 'empty' : 'claimed', message: `本次：${reward}${result.golden ? ' ★ Golden' : ''}` };
-}
+});
 
 /* ---- 7.10 YuScene：转盘 + 南瓜 ---- */
 /** 解析 "3 天 2 小时 5 分钟" 或 "(12月, 08:30)" 或 "(12 Dec, 08:30)" 形式的冷却文本 */
@@ -1921,13 +1962,8 @@ function parseYusceneNextTs(statusText, nextTime) {
     return new Date(year, month, parseInt(m[1], 10), parseInt(m[4], 10), parseInt(m[5], 10)).getTime();
 }
 
-async function claimOnYusceneSpinWheel() {
-    if (isOnLoginPageNow()) return { status: 'auth', message: '会话已过期，需要重新登录' };
-
-    const bodyText = document.body?.innerText || '';
-    if (isMaintenanceText(bodyText) && !document.querySelector('.pw__status')) {
-        return { status: 'maintenance', message: '站点维护中 (503)' };
-    }
+const claimOnYusceneSpinWheel = guardLogin(async () => {
+    if (isMaintenanceBody('.pw__status')) return { status: 'maintenance', message: '站点维护中 (503)' };
 
     const statusEl = await waitFor(() => document.querySelector('.pw__status'), 8000);
     if (!statusEl) return { status: 'skip', message: '未找到转盘组件（页面结构可能已变化）' };
@@ -2001,7 +2037,7 @@ async function claimOnYusceneSpinWheel() {
     } catch (e) {
         return { status: 'failed', message: `点击旋转按钮失败：${e.message || e}` };
     }
-}
+});
 
 async function claimYuscenePumpkin() {
     const done = r => { setPumpkinStatus(r.status, r.message); return r; };
@@ -2009,8 +2045,7 @@ async function claimYuscenePumpkin() {
     if (HOST !== 'yu-scene.net') return done({ status: 'skip', message: '非 YUSCENE 站点' });
     if (isOnLoginPageNow()) return done({ status: 'auth', message: '会话已过期' });
 
-    const bodyText = document.body?.innerText || '';
-    if (isMaintenanceText(bodyText) && !document.getElementById('halloween-bon')) {
+    if (isMaintenanceBody('#halloween-bon')) {
         const r = { status: 'maintenance', message: '站点维护中 (503)' };
         setPumpkinStatus(r.status, r.message);
         setSiteStatus(HOST, r);
@@ -2050,12 +2085,9 @@ async function claimYuscenePumpkin() {
 }
 
 /* ---- 7.11 FileList ---- */
-async function claimOnFilelist() {
-    if (isOnLoginPageNow()) return { status: 'auth', message: '会话已过期，需要重新登录' };
-    if (!location.pathname.includes('/spin.php')) {
-        location.href = location.origin + '/spin.php' + (location.hash || CLAIM_HASH);
-        return { status: 'navigating' };
-    }
+const claimOnFilelist = guardLogin(async () => {
+    const nav = ensurePath('/spin.php', '/spin.php');
+    if (nav) return nav;
 
     const bodyText = document.body.innerText || '';
     const cooldownMatch = bodyText.match(/Please check back again in\s*(?:(\d+)h\s*)?(?:(\d+)m\s*)?(?:(\d+)s)?/i);
@@ -2065,8 +2097,7 @@ async function claimOnFilelist() {
         const s = parseInt(cooldownMatch[3] || '0', 10);
         const nextTs = Date.now() + (h * 3600 + m * 60 + s) * 1000;
         GM_setValue(FILELIST_SPIN_NEXT_KEY, nextTs);
-        const lastReward = GM_getValue(FILELIST_LAST_REWARD_KEY, '未知');
-        return { status: 'already', message: `冷却中 · 上次：${lastReward} · 下次：${fmtNext(nextTs)}` };
+        return { status: 'already', message: cooldownText(GM_getValue(FILELIST_LAST_REWARD_KEY, '未知'), nextTs, false) };
     }
 
     const btn = document.querySelector('#spin');
@@ -2096,15 +2127,12 @@ async function claimOnFilelist() {
         return { status: 'claimed', message: `本次：${reward}` };
     }
     return { status: 'claimed', message: '已触发（未解析出具体奖励）' };
-}
+});
 
 /* ---- 7.12 MyFunZone ---- */
-async function claimOnMyFunZoneWheel() {
-    if (isOnLoginPageNow()) return { status: 'auth', message: '会话已过期，需要重新登录' };
-    if (!location.pathname.includes('/wheel')) {
-        location.href = location.origin + '/wheel' + (location.hash || CLAIM_HASH);
-        return { status: 'navigating' };
-    }
+const claimOnMyFunZoneWheel = guardLogin(async () => {
+    const nav = ensurePath('/wheel', '/wheel');
+    if (nav) return nav;
 
     await waitFor(() => document.body.innerText.includes('DAILY WHEEL') || document.querySelector('.dw-wrap'), 8000);
     const bodyText = document.body.innerText || '';
@@ -2118,11 +2146,7 @@ async function claimOnMyFunZoneWheel() {
         return { status: 'already', message: `今日已领 · 下次：${fmtClock(nextTs)}` };
     }
 
-    let csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || '';
-    if (!csrfToken) {
-        const match = document.cookie.match(/XSRF-TOKEN=([^;]+)/);
-        if (match) csrfToken = decodeURIComponent(match[1]);
-    }
+    const csrfToken = getCsrfToken();
 
     if (csrfToken) {
         try {
@@ -2167,17 +2191,15 @@ async function claimOnMyFunZoneWheel() {
     }
     if (result && result.type === 'done') return { status: 'claimed', message: '转盘已执行' };
     return { status: 'timeout', message: '旋转结果超时，请手动确认' };
-}
+});
 
 /* ---- 7.13 PolishTorrent ---- */
-async function claimOnPolishTorrentWheel() {
-    if (isOnLoginPageNow()) return { status: 'auth', message: '会话已过期，需要重新登录' };
-
+const claimOnPolishTorrentWheel = guardLogin(async () => {
     const btn = document.getElementById('spinBtn');
     if (!btn) return { status: 'skip', message: '未找到转盘按钮' };
     if (btn.disabled) return { status: 'already', message: '今日已领取' };
 
-    const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content;
+    const csrfToken = getCsrfToken();
     if (!csrfToken) return { status: 'failed', message: '未找到 CSRF Token' };
 
     try {
@@ -2199,28 +2221,29 @@ async function claimOnPolishTorrentWheel() {
     } catch (e) {
         return { status: 'failed', message: `请求异常：${e.message}` };
     }
-}
+});
 
 /* ---- 7.14 领取分发 ---- */
+/** handler 名 → 领取函数（czteam 的路径跳转已内置在 claimOnCzTeam 内） */
+const HANDLERS = {
+    czteam: claimOnCzTeam,
+    seedcore: claimOnSeedCore,
+    retrotoon: claimOnRetroToon,
+    myfunzone: claimOnMyFunZoneWheel,
+    polishtorrent: claimOnPolishTorrentWheel,
+    dirtybytes: claimOnDirtyBytes,
+    filelist: claimOnFilelist,
+    digitalcore: doDigitalCoreClaim,
+};
+
 function dispatchHandler(cfg) {
     const handler = cfg.handler || 'unit3d';
-    if (handler === 'czteam') {
-        if (!location.pathname.includes('events.php')) {
-            location.href = location.origin + '/events.php';
-            return { status: 'navigating' };
-        }
-        return claimOnCzTeam();
+    if (handler === 'unit3d' || handler === 'infinityhd') {
+        if (isOnEventPage()) return handleMultiEventClaim();
+        return handler === 'infinityhd' ? navigateToInfinityHDEventPage() : navigateToUnit3DEventPage(cfg);
     }
-    if (handler === 'seedcore') return claimOnSeedCore();
-    if (handler === 'retrotoon') return claimOnRetroToon();
-    if (handler === 'myfunzone') return claimOnMyFunZoneWheel();
-    if (handler === 'polishtorrent') return claimOnPolishTorrentWheel();
-    if (handler === 'dirtybytes') return claimOnDirtyBytes();
-    if (handler === 'filelist') return claimOnFilelist();
-    if ((handler === 'unit3d' || handler === 'infinityhd') && isOnEventPage()) return handleMultiEventClaim();
-    if (handler === 'infinityhd') return navigateToInfinityHDEventPage();
-    if (handler === 'digitalcore') return doDigitalCoreClaim();
-    return navigateToUnit3DEventPage(cfg);
+    const fn = HANDLERS[handler];
+    return fn ? fn(cfg) : navigateToUnit3DEventPage(cfg);
 }
 
 /* ==========================================================================
@@ -2256,7 +2279,7 @@ function checkDailyReset() {
     if (HOST === 'filelist.io') GM_deleteValue(FILELIST_SPIN_NEXT_KEY);
 
     clearCollectedRewards(HOST);
-    try { renderTable(); renderInactive(); renderStats(); } catch (e) {}
+    try { refreshUI(); } catch (e) {}
     return true;
 }
 
@@ -2298,7 +2321,7 @@ function resetAllStatuses() {
         sessionStorage.removeItem('pt_0df_attendance_reward');
         clearCollectedRewards(HOST);
     } catch (e) {}
-    renderTable(); renderInactive(); renderStats();
+    refreshUI();
 }
 
 function restoreDemotedSite(host) {
@@ -2345,17 +2368,9 @@ function getScanTargets(excludeHost) {
     return [...set];
 }
 
-const has0DayFilesTask = () =>
-    (Date.now() - GM_getValue(ATTENDANCE_LAST_CONFIRMED_KEY, 0) > ATTENDANCE_COOLDOWN)
-    || (GM_getValue(SPINWHEEL_NEXT_KEY, 0) <= Date.now());
+const has0DayFilesTask = () => !attendanceDone() || GM_getValue(SPINWHEEL_NEXT_KEY, 0) <= Date.now();
 
-function hasYusceneTask() {
-    const st = getSiteStatus('yu-scene.net');
-    const wheelOk = ['claimed', 'already', 'empty'].includes(st.status) && st.ts && (Date.now() - st.ts < DAY);
-    const last = GM_getValue(PUMPKIN_LAST_CLAIM_KEY, 0);
-    const pumpkinOk = last && (Date.now() - last < PUMPKIN_COOLDOWN);
-    return !(wheelOk && pumpkinOk);
-}
+const hasYusceneTask = () => !(yusceneWheelDone() && pumpkinDone());
 
 const hasFilelistTask = () => GM_getValue(FILELIST_SPIN_NEXT_KEY, 0) <= Date.now();
 
@@ -2372,33 +2387,30 @@ function checkNextTsTab(t) {
     if (!nextTs || nextTs > Date.now()) return;
     if (HOST === t.host && location.pathname === t.path) return;
     GM_setValue(t.key, 0);
-    GM_openInTab(t.url + CLAIM_HASH, { active: false, insert: true });
+    spawnClaimTab(t.url + CLAIM_HASH);
 }
 
 function check0DayFilesAttendance() {
     if (GM_getValue(AUTO_SCAN_ENABLED, true) !== true || isTaskLocked()) return;
     if (location.pathname === '/attendance' || location.pathname === '/spin-wheel') return;
-    if (Date.now() - GM_getValue(ATTENDANCE_LAST_CONFIRMED_KEY, 0) < ATTENDANCE_COOLDOWN) return;
+    if (attendanceDone()) return;
     if (Date.now() - GM_getValue(ATTENDANCE_LAST_ATTEMPT_KEY, 0) < ATTENDANCE_ATTEMPT_COOLDOWN) return;
     GM_setValue(ATTENDANCE_LAST_ATTEMPT_KEY, Date.now());
-    GM_openInTab('https://0dayfiles.net/attendance' + CLAIM_HASH, { active: false, insert: true });
+    spawnClaimTab('https://0dayfiles.net/attendance' + CLAIM_HASH);
 }
 
 function checkYusceneSpin() {
     if (GM_getValue(AUTO_SCAN_ENABLED, true) !== true || isTaskLocked()) return;
 
     const nextTs = GM_getValue(YUSCENE_SPIN_NEXT_KEY, 0);
-    const last = GM_getValue(PUMPKIN_LAST_CLAIM_KEY, 0);
-    const pumpkinOk = last && (Date.now() - last < PUMPKIN_COOLDOWN);
-
-    if (nextTs > Date.now() && pumpkinOk) return;
+    if (nextTs > Date.now() && pumpkinDone()) return;
     if (HOST === 'yu-scene.net' && (location.pathname === '/prize-wheel' || location.hash === PUMPKIN_HASH)) return;
 
     if (nextTs <= Date.now()) {
         GM_setValue(YUSCENE_SPIN_NEXT_KEY, 0);
-        GM_openInTab('https://yu-scene.net/prize-wheel' + CLAIM_HASH, { active: false, insert: true });
-    } else if (!pumpkinOk) {
-        GM_openInTab('https://yu-scene.net/' + PUMPKIN_HASH, { active: false, insert: true });
+        spawnClaimTab('https://yu-scene.net/prize-wheel' + CLAIM_HASH);
+    } else if (!pumpkinDone()) {
+        spawnClaimTab('https://yu-scene.net/' + PUMPKIN_HASH);
     }
 }
 
@@ -2425,14 +2437,39 @@ function maybeAutoScan() {
     setTimeout(() => { if (!isTaskLocked()) startAutoScan(true); }, 3000);
 }
 
+/** 开标签页并登记（active 时同时记为“当前 tab”供 closeSelf 使用） */
+function openTab(key, url, active = false) {
+    const tab = GM_openInTab(url, { active, insert: true });
+    if (active) window._pt_current_tab = tab;
+    tabRegistry[key] = tab;
+    return tab;
+}
+/** 关闭并注销登记的标签页 */
+function closeTab(key) {
+    const tab = tabRegistry[key];
+    if (!tab) return;
+    try { tab.close(); } catch (e) {}
+    delete tabRegistry[key];
+}
+/** 一次性后台标签页：无需回收登记，由页面自身关闭 */
+const spawnClaimTab = url => GM_openInTab(url, { active: false, insert: true });
+
 /** 开一个 tab、等站点状态落地、关掉 tab */
 async function withTab(host, url, timeout, tabKey = host) {
-    const tab = GM_openInTab(url, { active: false, insert: true });
-    tabRegistry[tabKey] = tab;
+    openTab(tabKey, url);
     await waitForSiteDone(host, timeout);
-    try { tab.close(); } catch (e) {}
-    delete tabRegistry[tabKey];
+    closeTab(tabKey);
     return getSiteStatus(host);
+}
+
+/** YuScene 南瓜页：开页 → 等页面自行领取 → 关掉（原先三处原样重复） */
+async function runPumpkinTab(host, { active = false, waitMs = 8000 } = {}) {
+    if (pumpkinDone()) return false;
+    const key = host + '#pumpkin';
+    openTab(key, buildClaimUrl(host, 'pumpkin'), active);
+    await sleep(waitMs);
+    closeTab(key);
+    return true;
 }
 
 async function startAutoScan(isAuto = false) {
@@ -2447,13 +2484,13 @@ async function startAutoScan(isAuto = false) {
 
     try {
         if (HOST === '0dayfiles.net') {
-            if (Date.now() - GM_getValue(ATTENDANCE_LAST_CONFIRMED_KEY, 0) > ATTENDANCE_COOLDOWN) {
+            if (!attendanceDone()) {
                 GM_setValue(ATTENDANCE_LAST_ATTEMPT_KEY, Date.now());
-                GM_openInTab('https://0dayfiles.net/attendance' + CLAIM_HASH, { active: false, insert: true });
+                spawnClaimTab('https://0dayfiles.net/attendance' + CLAIM_HASH);
             }
             if (GM_getValue(SPINWHEEL_NEXT_KEY, 0) <= Date.now()) {
                 GM_setValue(SPINWHEEL_NEXT_KEY, 0);
-                GM_openInTab('https://0dayfiles.net/spin-wheel' + CLAIM_HASH, { active: false, insert: true });
+                spawnClaimTab('https://0dayfiles.net/spin-wheel' + CLAIM_HASH);
             }
         }
 
@@ -2502,18 +2539,10 @@ async function startAutoScan(isAuto = false) {
                     log(`[Scan] ${host} 状态为 ${wheelSt.status}，跳过`);
                     continue;
                 }
-                const wheelDone = ['claimed', 'already', 'empty'].includes(wheelSt.status) && wheelSt.ts && (Date.now() - wheelSt.ts < DAY);
-                if (!wheelDone) await withTab(host, buildClaimUrl(host, 'claim'), SEQUENTIAL_TIMEOUT);
+                if (!yusceneWheelDone()) await withTab(host, buildClaimUrl(host, 'claim'), SEQUENTIAL_TIMEOUT);
 
                 await sleep(SEQUENTIAL_GAP);
-                const last = GM_getValue(PUMPKIN_LAST_CLAIM_KEY, 0);
-                if (!(last && (Date.now() - last < PUMPKIN_COOLDOWN))) {
-                    const tab = GM_openInTab(buildClaimUrl(host, 'pumpkin'), { active: false, insert: true });
-                    tabRegistry[host + '#pumpkin'] = tab;
-                    await sleep(8000);
-                    try { tab.close(); } catch (e) {}
-                    delete tabRegistry[host + '#pumpkin'];
-                }
+                await runPumpkinTab(host);
                 continue;
             }
 
@@ -2526,7 +2555,7 @@ async function startAutoScan(isAuto = false) {
         isAutoScanRunning = false;
         releaseTaskLock();
         toggleButtons(false);
-        renderStats(); renderTable(); renderInactive();
+        refreshUI();
         GM_setValue(AUTO_SCAN_TIME_KEY, Date.now());
     }
 }
@@ -2545,15 +2574,13 @@ async function runSequential(hosts, { taskName, activeTab, pendingMessage, state
             const host = hosts[i];
             setSiteStatus(host, { status: 'pending', message: pendingMessage });
 
-            const tab = GM_openInTab(buildClaimUrl(host), { active: activeTab, insert: true });
-            if (activeTab) window._pt_current_tab = tab;
-            tabRegistry[host] = tab;
+            openTab(host, buildClaimUrl(host), activeTab);
 
             const result = await waitForSiteDone(host);
             if (result.status === 'timeout' && !isTerminal(getSiteStatus(host))) {
                 setSiteStatus(host, { status: 'timeout', message: result.message || '超时' });
             }
-            try { tab.close(); } catch (e) {}
+            closeTab(host);
 
             if (host === 'yu-scene.net') {
                 await sleep(SEQUENTIAL_GAP);
@@ -2562,15 +2589,7 @@ async function runSequential(hosts, { taskName, activeTab, pendingMessage, state
                     log(`[Sequential] ${host} 状态为 ${wheelSt.status}，跳过南瓜`);
                     continue;
                 }
-                const last = GM_getValue(PUMPKIN_LAST_CLAIM_KEY, 0);
-                if (!(last && (Date.now() - last < PUMPKIN_COOLDOWN))) {
-                    const tab2 = GM_openInTab(buildClaimUrl(host, 'pumpkin'), { active: activeTab, insert: true });
-                    if (activeTab) window._pt_current_tab = tab2;
-                    tabRegistry[host + '#pumpkin'] = tab2;
-                    await sleep(8000);
-                    try { tab2.close(); } catch (e) {}
-                    delete tabRegistry[host + '#pumpkin'];
-                }
+                await runPumpkinTab(host, { active: activeTab });
             }
             if (i < hosts.length - 1) await sleep(SEQUENTIAL_GAP);
         }
@@ -2578,7 +2597,7 @@ async function runSequential(hosts, { taskName, activeTab, pendingMessage, state
         stateFlag(false);
         releaseTaskLock();
         toggleButtons(false);
-        renderStats(); renderTable(); renderInactive();
+        refreshUI();
     }
 }
 
@@ -2614,12 +2633,9 @@ async function startAllParallel() {
                     log(`[Parallel] ${host} 状态为 ${getSiteStatus(host).status}，跳过`);
                     return;
                 }
-                tabRegistry[host] = GM_openInTab(buildClaimUrl(host), { active: false, insert: true });
-                if (host === 'yu-scene.net') {
-                    const last = GM_getValue(PUMPKIN_LAST_CLAIM_KEY, 0);
-                    if (!(last && (Date.now() - last < PUMPKIN_COOLDOWN))) {
-                        tabRegistry[host + '#pumpkin'] = GM_openInTab(buildClaimUrl(host, 'pumpkin'), { active: false, insert: true });
-                    }
+                openTab(host, buildClaimUrl(host));
+                if (host === 'yu-scene.net' && !pumpkinDone()) {
+                    openTab(host + '#pumpkin', buildClaimUrl(host, 'pumpkin'));
                 }
             }, j * OPEN_TAB_INTERVAL);
         });
@@ -2669,32 +2685,24 @@ function mountPanel() {
 }
 
 /* ---- 面板内动作（统一事件委托，替代原先 4 处分散绑定） ---- */
-const YUSCENE_TAB_DONE = ['claimed', 'already', 'empty', 'failed', 'skip', 'auth', 'timeout', 'maintenance', 'notopen'];
-
-function openYusceneTab(mode) {
+/** 前台打开 YuScene 的转盘/南瓜页，等结果落地或 60s 后自动关闭 */
+async function openYusceneTab(mode) {
     const pumpkin = mode === 'pumpkin';
     const tabKey = pumpkin ? 'yu-scene.net#pumpkin' : 'yu-scene.net';
-    const tab = GM_openInTab(buildClaimUrl('yu-scene.net', pumpkin ? 'pumpkin' : 'claim'), { active: true, insert: true });
-    tabRegistry[tabKey] = tab;
+    openTab(tabKey, buildClaimUrl('yu-scene.net', pumpkin ? 'pumpkin' : 'claim'), true);
 
     const start = Date.now();
-    const timer = setInterval(() => {
+    await waitFor(() => {
         const st = pumpkin ? getPumpkinStatus() : getSiteStatus('yu-scene.net');
-        const done = YUSCENE_TAB_DONE.includes(st.status) && st.ts > start;
-        if (done || Date.now() - start > 60000) {
-            clearInterval(timer);
-            try { tab.close(); } catch (err) {}
-            delete tabRegistry[tabKey];
-        }
-    }, 500);
+        return (isSettled(st) && st.ts > start) || Date.now() - start > 60000;
+    }, 60000, 500);
+    closeTab(tabKey);
 }
 
 function retryHost(host) {
     setSiteStatus(host, { status: 'pending', message: '等待重试...' });
-    tabRegistry[host] = GM_openInTab(buildClaimUrl(host), { active: false, insert: true });
-    if (host === 'yu-scene.net') {
-        tabRegistry['yu-scene.net#pumpkin'] = GM_openInTab(buildClaimUrl(host, 'pumpkin'), { active: false, insert: true });
-    }
+    openTab(host, buildClaimUrl(host));
+    if (host === 'yu-scene.net') openTab(host + '#pumpkin', buildClaimUrl(host, 'pumpkin'));
 }
 
 async function checkHost(host) {
@@ -2704,7 +2712,7 @@ async function checkHost(host) {
 
     const st = getSiteStatus(host);
     if (st.status === 'pending' || st.status === 'claiming') setSiteStatus(host, { status: 'timeout', message: '检测超时' });
-    renderTable(); renderInactive(); renderStats();
+    refreshUI();
 }
 
 async function onPanelClick(e) {
@@ -2714,8 +2722,8 @@ async function onPanelClick(e) {
     const d = el.dataset;
 
     if (d.openYuscene) return openYusceneTab(d.openYuscene);
-    if (d.demote) { demoteSite(d.demote); renderTable(); renderInactive(); renderStats(); return; }
-    if (d.restore) { restoreDemotedSite(d.restore); renderTable(); renderInactive(); renderStats(); return; }
+    if (d.demote) { demoteSite(d.demote); refreshUI(); return; }
+    if (d.restore) { restoreDemotedSite(d.restore); refreshUI(); return; }
     if (d.retry) return retryHost(d.retry);
     if (d.check) return checkHost(d.check);
 }
@@ -2762,7 +2770,7 @@ function renderDashboard() {
 
         root.addEventListener('click', onPanelClick);
         setupListeners();
-        renderTable(); renderInactive(); renderStats();
+        refreshUI();
     } catch (e) {
         console.error(LOG, '渲染面板失败:', e);
     }
@@ -2772,7 +2780,7 @@ function setupListeners() {
     if (listenersRegistered) return;
     listenersRegistered = true;
 
-    const refresh = () => { renderTable(); renderInactive(); renderStats(); };
+    const refresh = refreshUI;
     const keys = new Set([...Object.keys(ALL_KNOWN_SITES), ...getAutoDemoted()].map(h => keyFor(h)));
     for (const k of [
         PROMOTED_KEY, DEMOTED_KEY, AUTO_SCAN_ENABLED, AUTO_SCAN_TIME_KEY,
@@ -2787,6 +2795,19 @@ function setupListeners() {
 }
 
 /* ---- 行渲染 ---- */
+/** 表格 / 已停止活动 / 统计三块统一刷新（原先 11 处手写三连调用） */
+const refreshUI = () => { renderTable(); renderInactive(); renderStats(); };
+/** 转盘格子统一渲染（0DayFiles / FileList 文案结构完全一致） */
+const spinCellHtml = (nextTs, lastReward, label = '🎡 Spin') => {
+    const last = escapeHtml(lastReward);
+    return nextTs > Date.now()
+        ? `${label}：<span style="color:#ffb266">冷却中</span> · 上次：<b>${last}</b> · 下次：${fmtNext(nextTs)}（${remainMin(nextTs)} 分钟后）`
+        : `${label}：<span style="color:#9ccc65">可领取</span> · 上次：<b>${last}</b>`;
+};
+/** 统计栏里的转盘倒计时片段 */
+const spinSummaryHtml = (label, nextTs) => nextTs > Date.now()
+    ? ` · <span style="color:#ffb266">${label}: ${remainMin(nextTs)} 分钟后</span>`
+    : ` · <span style="color:#9ccc65">${label}: 可领取</span>`;
 const emptyTable = rowsHtml => `<table><colgroup><col style="width:24%"><col style="width:18%"><col style="width:44%"><col style="width:14%"></colgroup><tbody>${rowsHtml}</tbody></table>`;
 
 const yusceneCellHtml = () => {
@@ -2794,37 +2815,25 @@ const yusceneCellHtml = () => {
     const wheelLabel = STATUS_LABELS[st.status] || st.status;
     const pumpkinSt = getPumpkinStatus();
     const pumpkinLabel = STATUS_LABELS[pumpkinSt.status] || pumpkinSt.status;
-    const last = GM_getValue(PUMPKIN_LAST_CLAIM_KEY, 0);
     const reward = GM_getValue(PUMPKIN_LAST_REWARD_KEY, '');
-    const ok = last && (Date.now() - last < PUMPKIN_COOLDOWN);
-    const pumpkinLine = ok
+    const pumpkinLine = pumpkinDone()
         ? `<span style="color:#9ccc65">🎃 南瓜：已领</span>${reward ? ` · 上次 ${escapeHtml(reward)}` : ''}`
         : `<span style="color:#ffb266">🎃 南瓜：${pumpkinLabel}</span> · ${escOrDash(pumpkinSt.message)}`;
     return `<div>🎡 转盘：<b>${wheelLabel}</b> · ${escOrDash(st.message)}</div><div style="margin-top:4px;color:#a89680;font-size:11px">${pumpkinLine}</div>`;
 };
 
-const filelistCellHtml = () => {
-    const nextTs = GM_getValue(FILELIST_SPIN_NEXT_KEY, 0);
-    const lastReward = escapeHtml(GM_getValue(FILELIST_LAST_REWARD_KEY, '未知'));
-    if (nextTs > Date.now()) {
-        return `🎡 Spin：<span style="color:#ffb266">冷却中</span> · 上次：<b>${lastReward}</b> · 下次：${fmtNext(nextTs)}（${remainMin(nextTs)} 分钟后）`;
-    }
-    return `🎡 Spin：<span style="color:#9ccc65">可领取</span> · 上次：<b>${lastReward}</b>`;
-};
+const filelistCellHtml = () =>
+    spinCellHtml(GM_getValue(FILELIST_SPIN_NEXT_KEY, 0), GM_getValue(FILELIST_LAST_REWARD_KEY, '未知'));
 
 const zerofilesCellHtml = () => {
-    const spinNext = GM_getValue(SPINWHEEL_NEXT_KEY, 0);
-    const spinLast = escapeHtml(GM_getValue(SPINWHEEL_LAST_REWARD_KEY, '未知'));
-    const attendOk = (Date.now() - GM_getValue(ATTENDANCE_LAST_CONFIRMED_KEY, 0)) < ATTENDANCE_COOLDOWN;
+    const attendOk = attendanceDone();
     const attendReward = GM_getValue(ATTENDANCE_LAST_REWARD_KEY, '');
 
     const attendStatus = attendOk
         ? `<span style="color:#9ccc65">✅ 已签到</span>${attendReward ? ` <span style="color:#9ccc65;font-weight:700">${escapeHtml(attendReward)}</span>` : ''}`
         : '<span style="color:#ffb266">⏳ 未签到</span>';
 
-    const spinInfo = spinNext > Date.now()
-        ? `🎡 Spin：<span style="color:#ffb266">冷却中</span> · 上次：<b>${spinLast}</b> · 下次：${fmtNext(spinNext)}（${remainMin(spinNext)} 分钟后）`
-        : `🎡 Spin：<span style="color:#9ccc65">可领取</span> · 上次：<b>${spinLast}</b>`;
+    const spinInfo = spinCellHtml(GM_getValue(SPINWHEEL_NEXT_KEY, 0), GM_getValue(SPINWHEEL_LAST_REWARD_KEY, '未知'));
 
     return `<div>${spinInfo}</div><div style="margin-top:4px;color:#a89680;font-size:11px">📅 签到：${attendStatus}</div>`;
 };
@@ -2977,11 +2986,8 @@ function renderStats() {
 
         const parts = [];
 
-        const spinNext = GM_getValue(SPINWHEEL_NEXT_KEY, 0);
-        const attendOk = (Date.now() - GM_getValue(ATTENDANCE_LAST_CONFIRMED_KEY, 0)) < ATTENDANCE_COOLDOWN;
-        parts.push(spinNext > Date.now()
-            ? ` · <span style="color:#ffb266">0DayFiles Spin: ${remainMin(spinNext)} 分钟后</span>`
-            : ' · <span style="color:#9ccc65">0DayFiles Spin: 可领取</span>');
+        const attendOk = attendanceDone();
+        parts.push(spinSummaryHtml('0DayFiles Spin', GM_getValue(SPINWHEEL_NEXT_KEY, 0)));
         parts.push(` · <span style="color:${attendOk ? '#9ccc65' : '#ffb266'}">签到: ${attendOk ? '已签到' : '未签到'}</span>`);
 
         const dbSt = getSiteStatus('dirtybytes.net');
@@ -2991,21 +2997,12 @@ function renderStats() {
         }
 
         const pumpkinSt = getPumpkinStatus();
-        const last = GM_getValue(PUMPKIN_LAST_CLAIM_KEY, 0);
-        const pumpkinOk = last && (Date.now() - last < PUMPKIN_COOLDOWN);
-        parts.push(pumpkinOk
+        parts.push(pumpkinDone()
             ? ' · <span style="color:#9ccc65">南瓜: 已领</span>'
             : ` · <span style="color:#ffb266">南瓜: ${STATUS_LABELS[pumpkinSt.status] || pumpkinSt.status}</span>`);
 
-        const yusNext = GM_getValue(YUSCENE_SPIN_NEXT_KEY, 0);
-        parts.push(yusNext > Date.now()
-            ? ` · <span style="color:#ffb266">YUSCENE 转盘: ${remainMin(yusNext)} 分钟后</span>`
-            : ' · <span style="color:#9ccc65">YUSCENE 转盘: 可领取</span>');
-
-        const flNext = GM_getValue(FILELIST_SPIN_NEXT_KEY, 0);
-        parts.push(flNext > Date.now()
-            ? ` · <span style="color:#ffb266">FileList Spin: ${remainMin(flNext)} 分钟后</span>`
-            : ' · <span style="color:#9ccc65">FileList Spin: 可领取</span>');
+        parts.push(spinSummaryHtml('YUSCENE 转盘', GM_getValue(YUSCENE_SPIN_NEXT_KEY, 0)));
+        parts.push(spinSummaryHtml('FileList Spin', GM_getValue(FILELIST_SPIN_NEXT_KEY, 0)));
 
         sum.innerHTML = `活跃进度：${done} / ${hosts.length} （${Math.round(pct)}%）${running}${scanning}${scanInfo}${parts.join('')}`;
     }
@@ -3052,6 +3049,16 @@ function registerPanelEntry() {
 /* ==========================================================================
    10. 入口
    ========================================================================== */
+/** 领取收尾：写状态 → 必要时刷新面板 → 按需自关标签页 */
+function finishClaim(result) {
+    if (!result || isNavigating(result)) return;
+    setSiteStatus(HOST, result);
+    if (!isAutoOpenedTab() && !window.opener) {
+        try { renderDashboard(); } catch (e) {}
+    }
+    closeSelf();
+}
+
 async function runClaim() {
     const pageHtml = document.documentElement?.outerHTML || '';
     const pageText = document.body?.innerText || '';
@@ -3094,14 +3101,7 @@ async function runClaim() {
     let result;
     try { result = await dispatchHandler(cfg); }
     catch (e) { result = { status: 'failed', message: `异常：${e.message || e}` }; }
-    if (!result) result = { status: 'skip', message: '无处理结果' };
-    if (result.status === 'navigating') return;
-
-    setSiteStatus(HOST, result);
-    if (!isAutoOpenedTab() && !window.opener) {
-        try { renderDashboard(); } catch (e) {}
-    }
-    closeSelf();
+    finishClaim(result || { status: 'skip', message: '无处理结果' });
 }
 
 function setupYuscenePumpkin() {
@@ -3174,13 +3174,7 @@ async function main() {
             setSiteStatus(HOST, { status: 'maintenance', message: '站点维护中' });
             return closeSelf();
         }
-        const result = await handleMultiEventClaim();
-        if (result.status === 'navigating') return;
-        setSiteStatus(HOST, result);
-        if (!isAutoOpenedTab() && !window.opener) {
-            try { renderDashboard(); } catch (e) {}
-        }
-        return closeSelf();
+        return finishClaim(await handleMultiEventClaim());
     }
 
     /* RetroToon 回跳确认 */
