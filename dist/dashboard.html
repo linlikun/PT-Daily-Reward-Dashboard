@@ -1,0 +1,28 @@
+<div class="pt-header" id="pt-header">
+    <span class="pt-title"><span class="pt-title-icon">🎁</span>PT外站 每日奖励面板</span>
+    <label class="autoscan-toggle" title="距上次扫描超过 1 小时时自动执行两阶段扫描">
+        <input type="checkbox" id="pt-toggle-autoscan" {{AUTOSCAN_CHECKED}}>
+        <span>每日自动扫描</span>
+    </label>
+    <span class="pt-sub" title="当前站点的本地日期（按 IANA 时区）">{{TODAY}}</span>
+    <button class="pt-toggle" id="pt-toggle">{{TOGGLE_ARROW}}</button>
+</div>
+<div class="pt-body">
+    <div class="controls">
+        <button class="primary" id="pt-btn-seq">▶ 串行领取全部</button>
+        <button id="pt-btn-parallel">⚡ 并行领取全部</button>
+        <button class="info" id="pt-btn-scan">🔍 立即扫描全部</button>
+        <button class="danger" id="pt-btn-reset">↺ 重置今日</button>
+        <button class="info" id="pt-btn-log">📋 导出日志</button>
+        <button class="danger" id="pt-btn-clearlog">🗑️ 清空日志</button>
+    </div>
+    <div class="progress-bar"><div id="pt-progress"></div></div>
+    <div class="summary" id="pt-summary">加载中...</div>
+    <h2 class="section-title">活跃站点 <span class="badge" id="pt-active-badge"></span></h2>
+    <table>
+        <colgroup><col style="width:24%"><col style="width:18%"><col style="width:44%"><col style="width:14%"></colgroup>
+        <thead><tr><th>站点</th><th>状态</th><th>礼物 / 消息</th><th>操作</th></tr></thead>
+        <tbody id="pt-tbody"></tbody>
+    </table>
+    <div id="pt-inactive"></div>
+</div>
