@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PT Daily Reward Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      10.3.0 (Core Split)
+// @version      10.3.1 (SeedCore 气泡礼物下线适配)
 // @description  多站点 PT 每日奖励控制面板；支持同站点多活动连续领取；极速后台静默领取；多特殊转盘支持
 // @author       Whale, DeepSeek
 // @license      GPL-3.0 License
@@ -1434,8 +1434,15 @@ const claimOnCzTeam = guardLogin(async () => {
 
 /* ---- 7.5 SeedCore ---- */
 async function handleSeedcoreBubble() {
-    const area = await waitFor(() => document.getElementById('reward-area-unique'), 5000, 200);
-    if (!area) return { result: 'unavailable' };
+    // 站点已移除气泡礼物：元素不存在时只给 800ms 渲染机会，避免 5s 空等
+    let area = document.getElementById('reward-area-unique');
+    if (!area) {
+        area = await waitFor(() => document.getElementById('reward-area-unique'), 800, 200);
+        if (!area) {
+            log('[SeedCore] 未检测到气泡礼物元素（站点已取消该功能），跳过');
+            return { result: 'unavailable' };
+        }
+    }
 
     const today = getSiteToday('seedcore.net');
     try {
@@ -1469,11 +1476,14 @@ async function handleSeedcoreBubble() {
 }
 
 const claimOnSeedCore = guardLogin(async () => {
-    const bubble = await handleSeedcoreBubble();
-    if (bubble.result === 'claimed') return { status: 'navigating' };
+    // 气泡礼物：元素存在才走，否则完全跳过（站点已取消）
+    if (document.getElementById('reward-area-unique')) {
+        const bubble = await handleSeedcoreBubble();
+        if (bubble.result === 'claimed') return { status: 'navigating' };
+    }
 
-    /* 首页 → 活动页 2；其它非活动页 → 首页 */
-    const nav = ensurePath(p => p === '/' || p === '', '/events/2') || ensurePath(() => isOnEventPage(), '/');
+    // 直接跳到固定活动页 /events/2（seedcore 活动 id 恒为 2）
+    const nav = ensurePath(() => isOnEventPage(), '/events/2');
     if (nav) return nav;
 
     await waitForEventArticles();
@@ -2776,9 +2786,39 @@ function registerPanelEntry() {
 /* ==========================================================================
    10. 入口
    ========================================================================== */
-/** 领取收尾：写状态 → 必要时刷新面板 → 按需自关标签页 */
+/* ---- navigating 兜底超时：防止服务端未重定向时状态永远停在 claiming ---- */
+const NAVIGATE_TIMEOUT = 30 * 1000;
+const _navWatchdogs = new Map();
+
+function armNavigateWatchdog(host, timeout = NAVIGATE_TIMEOUT) {
+    // 同站点重复触发时先清旧的
+    if (_navWatchdogs.has(host)) {
+        clearTimeout(_navWatchdogs.get(host));
+        _navWatchdogs.delete(host);
+    }
+    const startTs = Date.now();
+    const timer = setTimeout(() => {
+        _navWatchdogs.delete(host);
+        const st = getSiteStatus(host);
+        // 只有仍停留在本次提交的 claiming 状态才判超时
+        // （若已被新页面流程改成 already/claimed，st.ts 会 > startTs 或状态已变，跳过）
+        if (st.status === 'claiming' && (st.ts || 0) <= startTs) {
+            log(`[Watchdog] ${host} navigating 超时（${Math.round(timeout / 1000)}s），标记 timeout`);
+            setSiteStatus(host, { status: 'timeout', message: '提交后未收到服务端响应/跳转' });
+            try { renderDashboard(); } catch (e) {}
+            closeSelf();
+        }
+    }, timeout);
+    _navWatchdogs.set(host, timer);
+}
+
+    /** 领取收尾：写状态 → 必要时刷新面板 → 按需自关标签页 */
 function finishClaim(result) {
-    if (!result || isNavigating(result)) return;
+    if (!result) return;
+    if (isNavigating(result)) {
+        armNavigateWatchdog(HOST);
+        return;
+    }
     setSiteStatus(HOST, result);
     if (!isAutoOpenedTab() && !window.opener) {
         try { renderDashboard(); } catch (e) {}
