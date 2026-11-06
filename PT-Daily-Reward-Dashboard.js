@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PT Daily Reward Dashboard
 // @namespace    http://tampermonkey.net/
-// @version 10.3.3 (慢站超时宽容 & 刮刮卡拦截 & 无活动降级)
+// @version 10.3.4
 // @description  多站点 PT 每日奖励控制面板；支持同站点多活动连续领取；极速后台静默领取；多特殊转盘支持
 // @author       Whale, DeepSeek
 // @license      GPL-3.0 License
@@ -252,7 +252,7 @@ const STATUS_LABELS = {
 const TERMINAL_STATUSES = ['claimed', 'already', 'failed', 'skip', 'auth', 'timeout', 'empty', 'available', 'notopen', 'maintenance'];
 /** 已落定结论（不含 available）；tab 轮询与收尾共用一份，取代原先两份手写列表 */
 const SETTLED_STATUSES  = TERMINAL_STATUSES.filter(s => s !== 'available');
-const FAIL_STATUSES     = ['failed', 'skip', 'inactive'];
+const FAIL_STATUSES     = ['failed', 'inactive'];
 const isTerminal = st => TERMINAL_STATUSES.includes(st.status);
 const isSettled  = st => SETTLED_STATUSES.includes(st.status);
 
@@ -834,7 +834,7 @@ async function loadEventPage(fetcher, url, host, opts) {
     if (bad) return { status: bad };
 
     // 识别特殊重定向活动页（如刮刮卡），直接跳过
-    if (html.includes('scratch-card-component') || html.includes('/raspadinha')) {
+    if (html.includes('scratch-card-component') || html.includes('scratch-card-root')) {
         return { status: { status: 'skip', message: '特殊活动页面（刮刮卡），跳过' } };
     }
 
@@ -925,18 +925,23 @@ async function probeEventPaths(host, base, allPaths) {
     let hasAlready = false, hasNotopen = false, directClaimedCount = 0;
 
     const details = await Promise.allSettled(paths.map(p =>
-        loadEventPage((u, o) => gmFetch(u, o), `${base}${p}`, host, { timeout: 6000 })
-            .then(r => {
-                if (r.status && r.status.rateLimited) return { targetPath: p, rateLimited: true };
-                return r.article ? { targetPath: p, article: r.article, state: r.state } : null;
-            })
-    ));
+                                                       loadEventPage((u, o) => gmFetch(u, o), `${base}${p}`, host, { timeout: 6000 })
+                                                       .then(r => {
+        if (r.status && r.status.rateLimited) return { targetPath: p, rateLimited: true };
+        if (r.status && r.status.status === 'skip') return null; // 刮刮卡直接跳过
+        // 🎯 修改：如果拉取成功但没解析到标准结构（可能是特殊活动），标记为 unknown
+        return r.article ? { targetPath: p, article: r.article, state: r.state } : { targetPath: p, unknown: true };
+    })
+                                                      ));
 
     // POST /claims 串行，避免 CSRF 与限速冲突
     for (const r of details) {
         if (r.status !== 'fulfilled' || !r.value) continue;
         const v = r.value;
         if (v.rateLimited) { log(`[Probe] ${host} 429 限速，跳过本站剩余活动`); break; }
+
+        // 🎯 新增：如果是 unknown（特殊结构），直接推入需开 tab 领取，不要丢弃
+        if (v.unknown) { availablePaths.push(v.targetPath); continue; }
 
         const { targetPath, article, state } = v;
 
@@ -1008,12 +1013,134 @@ async function probeSpecialSiteHealth(host) {
     return null;
 }
 
-async function probeRemoteSite(host) {
+    async function probeRemoteSite(host) {
     const cfg = ALL_KNOWN_SITES[host];
     if (!cfg) return { status: 'skip', message: '未配置的站点' };
     if (KNOWN_INACTIVE[host] && !getPromoted().includes(host)) {
         return { status: 'inactive', message: KNOWN_INACTIVE[host].reason || '无活动' };
     }
+
+    // ================= 开始：后台静默探测特殊站点 =================
+
+    if (host === 'dirtybytes.net') {
+        try {
+            const res = await gmFetch(`${DIRTYBYTES_ORIGIN}${DIRTYBYTES_API}`, { timeout: 6000 });
+            if (res.status === 401 || res.status === 403 || (res.redirected && /login/i.test(res.finalUrl))) return { status: 'auth', message: '会话已过期' };
+            if (res.status >= 500) return { status: 'maintenance', message: `服务器错误 (HTTP ${res.status})` };
+            if (!res.ok) return { status: 'failed', message: `API HTTP ${res.status}` };
+            const data = JSON.parse(await res.text());
+            const bonus = data?.user?.dailyLoginBonusStatus;
+            if (!bonus) return { status: 'skip', message: '未找到每日登录奖励数据' };
+            const { streak = 0, cycleDay = 0, daysInCycle = 7, nextPoints = 0, progressPercent = 0 } = bonus;
+            if (bonus.claimedToday) {
+                const t = parseDirtyBytesLastClaim(bonus.lastClaim);
+                const lastClaimStr = t ? fmtClock(t.getTime()) : '今日';
+                return { status: 'already', message: `连续 ${streak} 天 · 周期 ${cycleDay}/${daysInCycle} · 进度 ${progressPercent}% · 下次 +${nextPoints}p · 上次 ${lastClaimStr}` };
+            }
+            return { status: 'available', message: `待登录发放 · 连续 ${streak} 天 · 下次 +${nextPoints}p` };
+        } catch (e) { return { status: 'failed', message: `异常：${e.message || e}` }; }
+    }
+
+    if (host === 'filelist.io') {
+        try {
+            const res = await gmFetch('https://filelist.io/spin.php', { timeout: 6000 });
+            if (res.ok) {
+                const html = await res.text();
+                const doc = new DOMParser().parseFromString(html, 'text/html');
+                const bodyText = doc.body?.innerText || '';
+                const cooldownMatch = bodyText.match(/Please check back again in\s*(?:(\d+)h\s*)?(?:(\d+)m\s*)?(?:(\d+)s)?/i);
+                if (cooldownMatch) {
+                    const h = parseInt(cooldownMatch[1] || '0', 10);
+                    const m = parseInt(cooldownMatch[2] || '0', 10);
+                    const s = parseInt(cooldownMatch[3] || '0', 10);
+                    const nextTs = Date.now() + (h * 3600 + m * 60 + s) * 1000;
+                    GM_setValue(FILELIST_SPIN_NEXT_KEY, nextTs);
+                    return { status: 'already', message: cooldownText(GM_getValue(FILELIST_LAST_REWARD_KEY, '未知'), nextTs, false) };
+                }
+                if (doc.querySelector('#spin')) return { status: 'available', message: '转盘可领取' };
+                return { status: 'skip', message: '未找到 Spin 按钮' };
+            }
+        } catch (e) {}
+    }
+
+    if (host === 'myfunzone.org') {
+        try {
+            const res = await gmFetch('https://myfunzone.org/wheel', { timeout: 6000 });
+            if (res.ok) {
+                const html = await res.text();
+                const doc = new DOMParser().parseFromString(html, 'text/html');
+                const bodyText = doc.body?.innerText || '';
+                if (bodyText.includes('SEE YOU TOMORROW') || bodyText.includes('Next spin in')) return { status: 'already', message: '今日已领' };
+                if (doc.querySelector('.dw-wrap') || bodyText.includes('DAILY WHEEL')) return { status: 'available', message: '转盘可领取' };
+                return { status: 'skip', message: '未找到转盘' };
+            }
+        } catch(e) {}
+    }
+
+    if (host === 'polishtorrent.top') {
+        try {
+            const res = await gmFetch('https://polishtorrent.top/', { timeout: 6000 });
+            if (res.ok) {
+                const html = await res.text();
+                const doc = new DOMParser().parseFromString(html, 'text/html');
+                const btn = doc.querySelector('#spinBtn');
+                if (btn) {
+                    if (btn.hasAttribute('disabled') || btn.classList.contains('disabled')) return { status: 'already', message: '今日已领取' };
+                    return { status: 'available', message: '转盘可领取' };
+                }
+                return { status: 'skip', message: '未找到转盘按钮' };
+            }
+        } catch(e) {}
+    }
+
+    if (host === 'czteam.me') {
+        try {
+            const res = await gmFetch('https://czteam.me/events.php', { timeout: 6000 });
+            if (res.ok) {
+                const html = await res.text();
+                const doc = new DOMParser().parseFromString(html, 'text/html');
+                const h2 = doc.querySelector('.gift-hero h2');
+                if (h2 && /already opened/i.test(h2.textContent || '')) return { status: 'already', message: '今日礼物已领取' };
+                if (doc.querySelector('button.gift-btn')) return { status: 'available', message: '礼物可领取' };
+                if (doc.querySelector('.gift-locked')) return { status: 'already', message: '今日已领取' };
+                return { status: 'skip', message: '未找到每日礼物按钮' };
+            }
+        } catch(e) {}
+    }
+
+    if (host === 'retrotoon.world') {
+        try {
+            const res = await gmFetch('https://retrotoon.world/attendance.php', { timeout: 6000 });
+            if (res.ok) {
+                const html = await res.text();
+                const doc = new DOMParser().parseFromString(html, 'text/html');
+                if (doc.querySelector('input[name="claim"][type="submit"], button[name="claim"]')) return { status: 'available', message: '签到可领取' };
+                return { status: 'already', message: '今日已签到' };
+            }
+        } catch(e) {}
+    }
+
+    if (host === 'seedcore.net') {
+        try {
+            const detail = await loadEventPage((u, o) => gmFetch(u, o), 'https://seedcore.net/events/2', host);
+            if (detail.article) {
+                if (detail.state === 'claimed') return { status: 'already', message: messagesOf(detail.article).join('，') || '今日已领' };
+                if (detail.state === 'unclaimed') return { status: 'available', message: '检测到可领取' };
+                if (detail.state === 'future') return { status: 'notopen', message: '今日未开放' };
+            } else if (detail.status) {
+                return detail.status;
+            }
+        } catch(e) {}
+    }
+
+    if (host === '0dayfiles.net') {
+        if (!attendanceDone() || GM_getValue(SPINWHEEL_NEXT_KEY, 0) <= Date.now()) {
+            return { status: 'available', message: '有签到/转盘任务待处理' };
+        }
+        return { status: 'already', message: '签到和转盘均已完成' };
+    }
+
+    // ================= 结束：后台静默探测特殊站点 =================
 
     if (cfg.handler !== 'unit3d' && cfg.handler !== 'infinityhd') {
         if (host === 'yu-scene.net') {
@@ -2243,15 +2370,11 @@ function clearHostCache(host) {
     GM_deleteValue(keyFor(host, 'pumpkin'));
     GM_deleteValue(lastOpenDateKey(host));
 
-    // 3) 循环保护键 pt_nav_guard_<host>_<path> —— GM 无枚举 API，扫常见 path
-    const KNOWN_PATHS = [
-        '/events', '/giveaways',
-        '/events/1', '/events/2', '/events/3', '/events/4', '/events/5',
-        '/events/6', '/events/7', '/events/8', '/events/9', '/events/10',
-        '/giveaways/1', '/giveaways/2', '/giveaways/3', '/giveaways/4',
-        '/giveaways/5', '/giveaways/6', '/giveaways/7', '/giveaways/8',
-        '/giveaways/9', '/giveaways/10',
-    ];
+    // 3) 循环保护键 pt_nav_guard_<host>_<path> —— 动态生成 1~30，覆盖更多活动 ID
+    const KNOWN_PATHS = ['/events', '/giveaways'];
+    for (let i = 1; i <= 30; i++) {
+        KNOWN_PATHS.push(`/events/${i}`, `/giveaways/${i}`);
+    }
     for (const p of KNOWN_PATHS) GM_deleteValue('pt_nav_guard_' + host + '_' + p);
 
     // 4) 站点专属键（仅清目标站，避免误删他站）
@@ -3145,6 +3268,13 @@ async function main() {
                 ? await claimOn0DayFilesAttendance()
                 : await claimOn0DayFilesSpinWheel());
         }
+        renderDashboard();
+        return registerPanelEntry();
+    }
+
+    /* 🎯 DirtyBytes：直接调 API 获取状态，告别长时间“检测中” */
+    if (HOST === 'dirtybytes.net') {
+        setSiteStatus(HOST, await claimOnDirtyBytes());
         renderDashboard();
         return registerPanelEntry();
     }
