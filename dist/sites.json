@@ -17,7 +17,7 @@
   "capybarabr.com":          { "handler": "unit3d" },
   "reelflix.cc":             { "handler": "unit3d" },
   "infinityhd.net":          { "handler": "infinityhd" },
-  "tracker.vietmediaf.store":{ "handler": "unit3d", "rewardPath": "/giveaways/2" },
+  "tracker.vietmediaf.store": { "handler": "unit3d", "rewardPath": "/giveaways", "rewardLinkText": ["Daily"] },
   "digitalcore.club":        { "handler": "digitalcore", "rewardPath": "/events" },
   "dirtybytes.net":          { "handler": "dirtybytes" },
   "czteam.me":               { "handler": "czteam", "rewardPath": "/events.php" },
