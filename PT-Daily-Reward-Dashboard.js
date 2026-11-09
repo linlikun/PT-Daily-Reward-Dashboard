@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PT Daily Reward Dashboard
 // @namespace    http://tampermonkey.net/
-// @version 10.3.4
+// @version      10.3.5
 // @description  多站点 PT 每日奖励控制面板；支持同站点多活动连续领取；极速后台静默领取；多特殊转盘支持
 // @author       Whale, DeepSeek
 // @license      GPL-3.0 License
@@ -90,7 +90,7 @@
 // ==/UserScript==
 
 /*
- * 结构说明（V10.3.0：公共层拆到 pt-core.js，经 @require 注入同一作用域）
+ * 结构说明（V10.3.5：修复部分 UI 重复、特殊站点无活动不降级、特殊站点探测误判超时）
  *   C. 公共层   —— pt-core.js：时间常量 / 日志 / 网络 / 页面判定 / 格式化 / 标签页
  *   0. 资源层   —— CSS / 面板模板 / 站点表 / 时区表全部来自 @resource
  *   1. 常量层   —— 时间、存储键、TTL
@@ -678,7 +678,7 @@ function buildSeedcoreBubbleMessage() {
         parts.push(`${label}：+${sub.join(' + ')}`);
     };
     push('气泡', bubblePts, bubbleTok);
-    push('日期', datePts, dateTok);
+    // push('日期', datePts, dateTok); // 修复：日期不在气泡里拼，交由外部处理
     return parts.join(' · ');
 }
 
@@ -808,6 +808,7 @@ function matchRewardTextScore(linkText, patterns) {
     }
     return best;
 }
+
 /* ==========================================================================
    6. 探测层
    ========================================================================== */
@@ -1065,13 +1066,21 @@ async function probeSpecialSiteHealth(host) {
 
     if (host === 'myfunzone.org') {
         try {
-            const res = await gmFetch('https://myfunzone.org/wheel', { timeout: 6000 });
+            const res = await gmFetch('https://myfunzone.org/', { timeout: 6000 });
             if (res.ok) {
                 const html = await res.text();
                 const doc = new DOMParser().parseFromString(html, 'text/html');
-                const bodyText = doc.body?.innerText || '';
-                if (bodyText.includes('SEE YOU TOMORROW') || bodyText.includes('Next spin in')) return { status: 'already', message: '今日已领' };
-                if (doc.querySelector('.dw-wrap') || bodyText.includes('DAILY WHEEL')) return { status: 'available', message: '转盘可领取' };
+                const fab = doc.getElementById('dw-fab');
+                const spinBtn = doc.getElementById('dw-spin');
+                const isFabAvailable = fab && fab.querySelector('b') && parseInt(fab.querySelector('b').textContent) > 0;
+                const isBtnAvailable = spinBtn && !spinBtn.disabled && spinBtn.textContent.includes('SPIN THE WHEEL');
+
+                if (isFabAvailable || isBtnAvailable) {
+                    return { status: 'available', message: '转盘可领取' };
+                }
+                if ((spinBtn && spinBtn.textContent.includes('SEE YOU TOMORROW')) || !fab) {
+                    return { status: 'already', message: '今日已领' };
+                }
                 return { status: 'skip', message: '未找到转盘' };
             }
         } catch(e) {}
@@ -1088,7 +1097,8 @@ async function probeSpecialSiteHealth(host) {
                     if (btn.hasAttribute('disabled') || btn.classList.contains('disabled')) return { status: 'already', message: '今日已领取' };
                     return { status: 'available', message: '转盘可领取' };
                 }
-                return { status: 'skip', message: '未找到转盘按钮' };
+                // 修复：找不到按钮视为无活动，累计失败次数达到阈值后自动降级
+                return { status: 'inactive', message: '未找到转盘按钮（可能已下线）' };
             }
         } catch(e) {}
     }
@@ -1108,17 +1118,7 @@ async function probeSpecialSiteHealth(host) {
         } catch(e) {}
     }
 
-    if (host === 'retrotoon.world') {
-        try {
-            const res = await gmFetch('https://retrotoon.world/attendance.php', { timeout: 6000 });
-            if (res.ok) {
-                const html = await res.text();
-                const doc = new DOMParser().parseFromString(html, 'text/html');
-                if (doc.querySelector('input[name="claim"][type="submit"], button[name="claim"]')) return { status: 'available', message: '签到可领取' };
-                return { status: 'already', message: '今日已签到' };
-            }
-        } catch(e) {}
-    }
+    // 修复：删除 retrotoon.world 的盲目 gmFetch 预判，交由开 tab 完整流程处理，避免误判 already 导致的超时。
 
     if (host === 'seedcore.net') {
         try {
@@ -1265,7 +1265,6 @@ async function probeSpecialSiteHealth(host) {
     if (detail.state === 'future')    return { status: 'notopen', message: '今日未开放', eventPath: targetPath };
     return { status: 'skip', message: '状态未知', eventPath: targetPath };
 }
-
 async function probeRemoteSiteWithBudget(host, budgetMs = PROBE_SITE_BUDGET) {
     if (host === 'jme-reunit3d.de') budgetMs = 45000;
     let timer;
@@ -1755,10 +1754,13 @@ const claimOnSeedCore = guardLogin(async () => {
     const unclaimed = document.querySelector(SEL_UNCLAIMED);
     if (!unclaimed) {
         const parts = [];
-        const bubbleMsg = buildSeedcoreBubbleMessage();
-        if (bubbleMsg) parts.push(bubbleMsg);
+        // 修复：先提取日期奖励，再提取气泡奖励，避免重复拼接
         const rewardText = extractRewardText();
         if (rewardText) parts.push(`日期：${rewardText}`);
+        
+        const bubbleMsg = buildSeedcoreBubbleMessage();
+        if (bubbleMsg) parts.unshift(bubbleMsg);
+
         return { status: 'already', message: parts.join(' · ') || '今日全部奖励已领取' };
     }
 
@@ -2156,10 +2158,16 @@ const claimOnMyFunZoneWheel = guardLogin(async () => {
     const nav = ensurePath('/wheel', '/wheel');
     if (nav) return nav;
 
-    await waitFor(() => document.body.innerText.includes('DAILY WHEEL') || document.querySelector('.dw-wrap'), 8000);
-    const bodyText = document.body.innerText || '';
+    // 等待悬浮按钮或主按钮加载
+    await waitFor(() => document.getElementById('dw-fab') || document.getElementById('dw-spin'), 8000);
 
-    if (bodyText.includes('SEE YOU TOMORROW') || bodyText.includes('Next spin in')) {
+    const fab = document.getElementById('dw-fab');
+    const spinBtn = document.getElementById('dw-spin');
+    const isFabAvailable = fab && fab.querySelector('b') && parseInt(fab.querySelector('b').textContent) > 0;
+    const isBtnAvailable = spinBtn && !spinBtn.disabled && spinBtn.textContent.includes('SPIN THE WHEEL');
+    const isDone = (spinBtn && spinBtn.textContent.includes('SEE YOU TOMORROW')) || (!fab && !isBtnAvailable);
+
+    if (!isFabAvailable && !isBtnAvailable && isDone) {
         let nextTs = GM_getValue(MYFUNZONE_SPIN_NEXT_KEY, 0);
         if (nextTs <= Date.now()) {
             nextTs = Date.now() + 24 * HOUR;
@@ -2168,58 +2176,75 @@ const claimOnMyFunZoneWheel = guardLogin(async () => {
         return { status: 'already', message: `今日已领 · 下次：${fmtClock(nextTs)}` };
     }
 
-    const csrfToken = getCsrfToken();
-
-    if (csrfToken) {
-        try {
-            const res = await fetch('https://myfunzone.org/wheel/spin', {
-                method: 'POST',
-                headers: { 'accept': 'application/json', 'x-csrf-token': csrfToken, 'x-requested-with': 'XMLHttpRequest' },
-                credentials: 'include',
-            });
-            if (res.status === 419) return { status: 'failed', message: 'CSRF 令牌过期 (419)' };
-            if (res.status === 409) return { status: 'already', message: '今日已领取' };
-            if (res.ok) {
-                const data = await res.json();
-                GM_setValue(MYFUNZONE_SPIN_NEXT_KEY, Date.now() + 24 * HOUR);
-                if (data.ok) {
-                    const spinBtn = [...document.querySelectorAll('button')].find(b => b.innerText.includes('SPIN THE WHEEL'));
-                    if (spinBtn && !spinBtn.disabled) spinBtn.click();
-                    return { status: 'claimed', message: `本次：${data.label || '未知'}` };
-                }
-                return { status: 'already', message: data.message || '今日已领取' };
-            }
-        } catch (e) { log(`[MyFunZone] API 请求异常: ${e.message}`); }
+    // 如果弹窗没打开，先点开悬浮按钮
+    if ((!spinBtn || spinBtn.offsetParent === null) && fab && fab.offsetParent !== null) {
+        fab.click();
+        await sleep(600);
     }
 
-    log('[MyFunZone] 降级为 UI 模拟点击…');
-    const btn = [...document.querySelectorAll('button')].find(b => b.innerText.includes('SPIN THE WHEEL'));
-    if (!btn) return { status: 'skip', message: '未找到转盘按钮' };
-    if (btn.disabled) return { status: 'already', message: '今日已领取' };
+    const targetBtn = document.getElementById('dw-spin');
+    if (!targetBtn) return { status: 'skip', message: '未找到转盘按钮' };
+    if (targetBtn.disabled) return { status: 'already', message: '今日已领取' };
 
-    try { btn.click(); } catch (e) { return { status: 'failed', message: `点击失败：${e.message}` }; }
+    // 拦截 fetch 抓取结果，无需等待漫长的动画
+    let capturedJson = null;
+    const origFetch = window.fetch;
+    window.fetch = async function(...args) {
+        const response = await origFetch.apply(this, args);
+        if (args[0] && String(args[0]).includes('/wheel/spin')) {
+            try {
+                const clone = response.clone();
+                capturedJson = await clone.json();
+            } catch (e) {}
+        }
+        return response;
+    };
+
+    try { targetBtn.click(); } catch (e) {
+        window.fetch = origFetch;
+        return { status: 'failed', message: `点击失败：${e.message}` };
+    }
 
     const result = await waitFor(() => {
-        const t = document.body.innerText;
-        if (t.includes('You won:')) return { type: 'win' };
-        if (t.includes('SEE YOU TOMORROW')) return { type: 'done' };
-        return null;
-    }, 15000, 200);
+        if (capturedJson) return { type: 'json', data: capturedJson };
 
+        const sub = document.getElementById('dw-sub');
+        if (sub) {
+            if (sub.textContent.includes('You won:')) {
+                const match = sub.textContent.match(/You won:\s*(.+?)!/i);
+                return { type: 'win', label: match ? match[1] : '未知' };
+            }
+            if (sub.textContent.includes('Something went wrong') || sub.textContent.includes('Network error')) {
+                return { type: 'error', label: sub.textContent };
+            }
+            if (sub.textContent.includes('SEE YOU TOMORROW')) {
+                return { type: 'done' };
+            }
+        }
+        return null;
+    }, 20000, 200);
+
+    window.fetch = origFetch;
     GM_setValue(MYFUNZONE_SPIN_NEXT_KEY, Date.now() + 24 * HOUR);
 
-    if (result && result.type === 'win') {
-        const winMatch = document.body.innerText.match(/You won:\s*(.+?)!/i);
-        return { status: 'claimed', message: `本次：${winMatch ? winMatch[1] : '未知'}` };
+    if (result) {
+        if (result.type === 'json') {
+            if (result.data.ok) return { status: 'claimed', message: `本次：${result.data.label || '未知'}` };
+            return { status: 'already', message: result.data.message || '今日已领取' };
+        }
+        if (result.type === 'win') return { status: 'claimed', message: `本次：${result.label}` };
+        if (result.type === 'done') return { status: 'claimed', message: '转盘已执行' };
+        if (result.type === 'error') return { status: 'failed', message: result.label };
     }
-    if (result && result.type === 'done') return { status: 'claimed', message: '转盘已执行' };
+
     return { status: 'timeout', message: '旋转结果超时，请手动确认' };
 });
 
 /* ---- 7.13 PolishTorrent ---- */
 const claimOnPolishTorrentWheel = guardLogin(async () => {
     const btn = document.getElementById('spinBtn');
-    if (!btn) return { status: 'skip', message: '未找到转盘按钮' };
+    // 修复：找不到按钮返回 inactive 以便触发自动降级机制
+    if (!btn) return { status: 'inactive', message: '未找到转盘按钮（可能已下线）' };
     if (btn.disabled) return { status: 'already', message: '今日已领取' };
 
     const csrfToken = getCsrfToken();
@@ -2268,6 +2293,7 @@ function dispatchHandler(cfg) {
     const fn = HANDLERS[handler];
     return fn ? fn(cfg) : navigateToUnit3DEventPage(cfg);
 }
+
 /* ==========================================================================
    8. 调度层
    ========================================================================== */
