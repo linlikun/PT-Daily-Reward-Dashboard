@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         PT Daily Reward Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      10.3.7
-// @description  多站点 PT 每日奖励控制面板；支持同站点多活动连续领取；极速后台静默领取；多特殊转盘支持；修复 seedpool 隐藏报错及误报成功；新增 polishtorrent/myfunzone/yu-scene 的 /events + 特殊玩法双分支
+// @version      10.3.8
+// @description  多站点 PT 每日奖励控制面板；支持同站点多活动连续领取；极速后台静默领取；多特殊转盘支持；UI小型化
 // @author       Whale, DeepSeek
 // @license      GPL-3.0 License
 // @match        https://bitporn.eu/*
@@ -2535,7 +2535,78 @@ function ensurePanelCss() {
     if (!css) { logWarn('[UI] 样式资源为空，面板将以无样式呈现'); return; }
     const st = document.createElement('style');
     st.id = 'pt-panel-css';
-    st.textContent = css;
+    st.textContent = css + `
+        /* ====== 面板展开时的定位 ====== */
+        #pt-dashboard-root:not(.collapsed) {
+            left: auto !important;
+            right: 20px !important;
+            bottom: 20px !important;
+            position: fixed !important;
+            max-height: 85vh !important;
+            overflow: auto !important;
+            z-index: 99999 !important;
+        }
+
+        /* ====== 折叠时变身小 Logo 悬浮球 ====== */
+        #pt-dashboard-root.collapsed {
+            width: 56px !important;
+            height: 56px !important;
+            min-width: 56px !important;
+            max-width: 56px !important;
+            border-radius: 50% !important;
+            padding: 0 !important;
+            margin: 0 !important;
+            left: auto !important;
+            right: 20px !important;
+            bottom: 20px !important;
+            background: linear-gradient(135deg, #2a2a2a, #1a1a1a) !important;
+            border: 2px solid #ffb266 !important;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.6) !important;
+            cursor: pointer !important;
+            overflow: hidden !important;
+            transition: transform 0.2s, box-shadow 0.2s !important;
+            z-index: 99999 !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            transform: none !important;
+        }
+        #pt-dashboard-root.collapsed:hover {
+            transform: scale(1.1) !important;
+            box-shadow: 0 6px 20px rgba(255,178,102,0.4) !important;
+        }
+        /* 隐藏面板主体内容 */
+        #pt-dashboard-root.collapsed > *:not(#pt-header) {
+            display: none !important;
+        }
+        /* 让头部占满整个小圆球，确保点击有效 */
+        #pt-dashboard-root.collapsed #pt-header {
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            width: 100% !important;
+            height: 100% !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            background: transparent !important;
+            border: none !important;
+            cursor: pointer !important;
+            box-shadow: none !important;
+            border-radius: 50% !important;
+        }
+        /* 隐藏头部原本的文字和开关 */
+        #pt-dashboard-root.collapsed #pt-header * {
+            display: none !important;
+        }
+        /* 使用礼物图标作为小 Logo */
+        #pt-dashboard-root.collapsed #pt-header::after {
+            content: "🎁";
+            display: block !important;
+            font-size: 28px !important;
+            line-height: 1 !important;
+            text-shadow: 0 2px 4px rgba(0,0,0,0.5) !important;
+        }
+    `;
     (document.head || document.documentElement).appendChild(st);
 }
 
@@ -2544,7 +2615,7 @@ function mountPanel() {
     ensurePanelCss();
     const tpl = panelHtml();
     if (!tpl.trim()) { logError('[UI] 面板模板资源为空，跳过渲染'); return null; }
-    const collapsedNow = GM_getValue(COLLAPSE_KEY, false) === true;
+    const collapsedNow = GM_getValue(COLLAPSE_KEY, true) === true;
     const filled = tpl
         .replace(/\{\{\s*TODAY\s*\}\}/g, TODAY)
         .replace(/\{\{\s*TOGGLE_ICON\s*\}\}/g, collapsedNow ? '▸' : '▾')
@@ -2607,7 +2678,7 @@ function renderDashboard() {
         const root = mountPanel();
         if (!root) return;
         const $ = id => root.querySelector('#' + id);
-        const collapsed = GM_getValue(COLLAPSE_KEY, false) === true;
+        const collapsed = GM_getValue(COLLAPSE_KEY, true) === true;
         root.classList.toggle('collapsed', collapsed);
         const toggleBtn = $('pt-toggle') || root.querySelector('.pt-toggle');
         const dateEl = $('pt-date') || root.querySelector('.pt-sub');
