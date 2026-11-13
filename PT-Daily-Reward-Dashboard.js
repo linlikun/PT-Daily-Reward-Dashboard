@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         PT Daily Reward Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      10.3.6
-// @description  多站点 PT 每日奖励控制面板；支持同站点多活动连续领取；极速后台静默领取；多特殊转盘支持；修复 seedpool 隐藏报错及误报成功
+// @version      10.3.7
+// @description  多站点 PT 每日奖励控制面板；支持同站点多活动连续领取；极速后台静默领取；多特殊转盘支持；修复 seedpool 隐藏报错及误报成功；新增 polishtorrent/myfunzone/yu-scene 的 /events + 特殊玩法双分支
 // @author       Whale, DeepSeek
 // @license      GPL-3.0 License
 // @match        https://bitporn.eu/*
@@ -90,9 +90,14 @@
 // ==/UserScript==
 
 /*
- * V10.3.7：修复 seedpool 满屏历史 claimed 导致的误报成功；
- *           修复隐藏的 ERROR_COPY 节点导致的死循环弹窗；
- *           加入日期精准锚定。
+ * V10.3.8：
+ *   1. 修复 buildClaimUrl 里 polishtorrent 分支使用 hash 时触发 TDZ 的致命 bug。
+ *   2. probeRemoteSite 的 polishtorrent 分支：改为 GET /spin，且按钮 disabled 时读 .spin-already strong 显示上次奖励。
+ *   3. polishtorrent 的 claim：A 分支收紧为 isOnEventPage()，活动过期时回退 /spin；C 分支 disabled 时读上次奖励。
+ *   4. myfunzone.org：新增 /events 探测；claim 增加 A(活动详情)/B(/events 列表)/C(/wheel) 三分支。
+ *   5. yu-scene.net：probe 增加 /events 偶发活动探测；claim 侧在 runClaim 专属分支加 /events 处理（见第二部分）。
+ *   6. buildClaimUrl：myfunzone / yu-scene 有活动缓存走活动页，无缓存走各自特殊玩法页。
+ *   7. MULTI_TASK_SITES 加入 polishtorrent/myfunzone/yu-scene，避免单侧失败触发自动降级。
  */
 
 (function () {
@@ -211,7 +216,8 @@ const isNavigating = r => !!r && r.status === 'navigating';
 const loginGate = () => (isOnLoginPageNow() ? authResult() : null);
 const guardLogin = fn => async (...a) => loginGate() || fn(...a);
 
-const MULTI_TASK_SITES = new Set(['0dayfiles.net']);
+// 【修改 7】多任务站点加入 polishtorrent/myfunzone/yu-scene，避免单侧失败触发自动降级
+const MULTI_TASK_SITES = new Set(['0dayfiles.net', 'polishtorrent.top', 'myfunzone.org', 'yu-scene.net']);
 const TAB_ONLY_HANDLERS = new Set(['czteam', 'seedcore', 'retrotoon', '0dayfiles', 'digitalcore', 'myfunzone', 'polishtorrent', 'filelist']);
 const AUTO_SCAN_CFG = { failureThreshold: 3, intervalBetween: 2500, maxPerRun: 100 };
 
@@ -749,7 +755,6 @@ async function postClaimToken(postUrl, token, referer) {
     }
 }
 
-// 【修复 1】精准判断今日是否领取，拦截隐藏的 ERROR_COPY
 async function submitClaimPost(action, token, referer, refreshToken) {
     const postUrl = new URL(action, location.origin).href;
     let res = await postClaimToken(postUrl, token, referer);
@@ -882,7 +887,9 @@ async function probeSpecialSiteHealth(host) {
         return { status: 'failed', message: `探测异常：${msg}` };
     }
     return null;
-}async function probeRemoteSite(host) {
+}
+
+async function probeRemoteSite(host) {
     const cfg = ALL_KNOWN_SITES[host];
     if (!cfg) return { status: 'skip', message: '未配置的站点' };
     if (KNOWN_INACTIVE[host] && !getPromoted().includes(host)) {
@@ -915,6 +922,12 @@ async function probeSpecialSiteHealth(host) {
                 const html = await res.text();
                 const doc = new DOMParser().parseFromString(html, 'text/html');
                 const bodyText = doc.body?.innerText || '';
+
+                // 【新增】优先识别“活动已结束”提示
+                if (/This event has ended|Please check again later/i.test(bodyText)) {
+                    return { status: 'inactive', message: '转盘活动已结束' };
+                }
+
                 const cooldownMatch = bodyText.match(/Please check back again in\s*(?:(\d+)h\s*)?(?:(\d+)m\s*)?(?:(\d+)s)?/i);
                 if (cooldownMatch) {
                     const h = parseInt(cooldownMatch[1] || '0', 10);
@@ -931,6 +944,18 @@ async function probeSpecialSiteHealth(host) {
     }
 
     if (host === 'myfunzone.org') {
+        // 【修改 4】先探 UNIT3D /events（偶发活动）
+        try {
+            const res = await gmFetch('https://myfunzone.org/events', { timeout: 6000 });
+            if (res.ok) {
+                const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
+                const list = checkEventList(doc, host);
+                if (list.paths && list.paths.length) {
+                    return await probeEventPaths(host, 'https://myfunzone.org', list.paths);
+                }
+            }
+        } catch (e) {}
+        // 原有转盘探测
         try {
             const res = await gmFetch('https://myfunzone.org/', { timeout: 6000 });
             if (res.ok) {
@@ -948,19 +973,47 @@ async function probeSpecialSiteHealth(host) {
     }
 
     if (host === 'polishtorrent.top') {
+        // 【修改 2】先探 UNIT3D /events（节日活动）
         try {
-            const res = await gmFetch('https://polishtorrent.top/', { timeout: 6000 });
+            const res = await gmFetch('https://polishtorrent.top/events', { timeout: 6000 });
             if (res.ok) {
-                const html = await res.text();
-                const doc = new DOMParser().parseFromString(html, 'text/html');
-                const btn = doc.querySelector('#spinBtn');
-                if (btn) {
-                    if (btn.hasAttribute('disabled') || btn.classList.contains('disabled')) return { status: 'already', message: '今日已领取' };
-                    return { status: 'available', message: '转盘可领取' };
+                const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
+                const list = checkEventList(doc, host);
+                if (list.paths && list.paths.length) {
+                    return await probeEventPaths(host, 'https://polishtorrent.top', list.paths);
                 }
-                return { status: 'inactive', message: '未找到转盘按钮（可能已下线）' };
             }
         } catch (e) {}
+        // 【修改 2】再探 /spin（转盘），注意是 /spin 不是 /
+        try {
+            const res = await gmFetch('https://polishtorrent.top/spin', { timeout: 6000 });
+            if (res.ok) {
+                const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
+                const btn = doc.querySelector('#spinBtn');
+                if (!btn) return { status: 'inactive', message: '未找到转盘按钮（页面结构可能已变化）' };
+                if (btn.hasAttribute('disabled') || btn.classList.contains('disabled')) {
+                    const last = doc.querySelector('.spin-already strong')?.textContent?.trim() || '';
+                    return { status: 'already', message: last ? `今日已领 · 上次：${last}` : '今日转盘已领取' };
+                }
+                return { status: 'available', message: '转盘可领取' };
+            }
+        } catch (e) {}
+        return { status: 'skip', message: 'events 与 /spin 均探测失败' };
+    }
+
+    // 【修改 5】yu-scene：先探 /events（偶发活动），无活动再走 needsTab
+    if (host === 'yu-scene.net') {
+        try {
+            const res = await gmFetch('https://yu-scene.net/events', { timeout: 6000 });
+            if (res.ok) {
+                const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
+                const list = checkEventList(doc, host);
+                if (list.paths && list.paths.length) {
+                    return await probeEventPaths(host, 'https://yu-scene.net', list.paths);
+                }
+            }
+        } catch (e) {}
+        // 继续走下方 needsTab 分支（其中会做 /prize-wheel 健康检查）
     }
 
     if (host === 'czteam.me') {
@@ -1117,12 +1170,16 @@ async function probeAllSitesParallel(hosts, concurrency = 4) {
     const results = {};
     let idx = 0, done = 0;
     const total = hosts.length;
+    // 【新增】这三个站点不使用 12 小时缓存，每次扫描强制重新探测
+    const FORCE_REPROBE = new Set(['filelist.io', 'dirtybytes.net', '0dayfiles.net']);
     async function worker() {
         while (idx < total) {
             const host = hosts[idx++];
             try {
                 const st = getSiteStatus(host);
-                if ((st.status === 'claimed' || st.status === 'already') && Date.now() - st.ts < TTL_RECHECK) {
+                if (!FORCE_REPROBE.has(host) &&
+                    (st.status === 'claimed' || st.status === 'already') &&
+                    Date.now() - st.ts < TTL_RECHECK) {
                     results[host] = st;
                 } else {
                     const r = await probeRemoteSiteWithBudget(host);
@@ -1196,9 +1253,28 @@ async function _autoDetectRewardPathInner() {
     return null;
 }
 
+// 【修改 1 + 6】buildClaimUrl：hash 提到函数首行（修 TDZ）；myfunzone/yu-scene 有活动缓存走活动页，无缓存走各自特殊玩法页
 const buildClaimUrl = (host, mode = 'claim') => {
-    if (host === 'yu-scene.net' && mode === 'pumpkin') return `https://yu-scene.net/${PUMPKIN_HASH}`;
     const hash = mode === 'detect' ? DETECT_HASH : CLAIM_HASH;
+    if (host === 'polishtorrent.top') {
+        const cached = getCachedEventPath(host);
+        return cached
+            ? `https://${host}${cached}${hash}`
+            : `https://${host}/events${hash}`;
+    }
+    if (host === 'myfunzone.org') {
+        const cached = getCachedEventPath(host);
+        return cached
+            ? `https://${host}${cached}${hash}`
+            : `https://${host}/wheel${hash}`;
+    }
+    if (host === 'yu-scene.net') {
+        if (mode === 'pumpkin') return `https://yu-scene.net/${PUMPKIN_HASH}`;
+        const cached = getCachedEventPath(host);
+        return cached
+            ? `https://${host}${cached}${hash}`
+            : `https://${host}/prize-wheel${hash}`;
+    }
     if (host === '0dayfiles.net') {
         return `https://0dayfiles.net/${attendanceDone() ? 'spin-wheel' : 'attendance'}${hash}`;
     }
@@ -1861,7 +1937,14 @@ async function claimYuscenePumpkin() {
 const claimOnFilelist = guardLogin(async () => {
     const nav = ensurePath('/spin.php', '/spin.php');
     if (nav) return nav;
+
     const bodyText = document.body.innerText || '';
+
+    // 【新增】优先识别“活动已结束”提示
+    if (/This event has ended|Please check again later/i.test(bodyText)) {
+        return { status: 'inactive', message: '转盘活动已结束' };
+    }
+
     const cooldownMatch = bodyText.match(/Please check back again in\s*(?:(\d+)h\s*)?(?:(\d+)m\s*)?(?:(\d+)s)?/i);
     if (cooldownMatch) {
         const h = parseInt(cooldownMatch[1] || '0', 10);
@@ -1871,8 +1954,10 @@ const claimOnFilelist = guardLogin(async () => {
         GM_setValue(FILELIST_SPIN_NEXT_KEY, nextTs);
         return { status: 'already', message: cooldownText(GM_getValue(FILELIST_LAST_REWARD_KEY, '未知'), nextTs, false) };
     }
+
     const btn = document.querySelector('#spin');
     if (!btn) return { status: 'skip', message: '未找到 Spin 按钮' };
+
     let interceptedMsg = null;
     const origAlert = window.alert;
     window.alert = msg => { interceptedMsg = msg; };
@@ -1894,7 +1979,29 @@ const claimOnFilelist = guardLogin(async () => {
     return { status: 'claimed', message: '已触发（未解析出具体奖励）' };
 });
 
+// 【修改 4】myfunzone：A(活动详情)/B(/events 列表)/C(/wheel) 三分支
 const claimOnMyFunZoneWheel = guardLogin(async () => {
+    // A) 活动详情页 → 先尝试活动；过期/无活动则回退 /wheel
+    if (isOnEventPage()) {
+        const r = await handleMultiEventClaim();
+        if (r && ['inactive', 'notopen', 'skip'].includes(r.status) && !isNavigating(r)) {
+            location.href = location.origin + '/wheel' + CLAIM_HASH;
+            return { status: 'navigating' };
+        }
+        return r;
+    }
+    // B) /events 列表页 → 找今日活动跳转；无活动则去 /wheel
+    if (location.pathname === '/events' || location.pathname === '/events/') {
+        const list = checkEventList(document, HOST);
+        if (list.paths && list.paths.length) {
+            if (list.paths.length > 1) setPendingEvents(HOST, list.paths);
+            location.href = location.origin + list.paths[0] + CLAIM_HASH;
+            return { status: 'navigating' };
+        }
+        location.href = location.origin + '/wheel' + CLAIM_HASH;
+        return { status: 'navigating' };
+    }
+    // C) /wheel 原有逻辑
     const nav = ensurePath('/wheel', '/wheel');
     if (nav) return nav;
     await waitFor(() => document.getElementById('dw-fab') || document.getElementById('dw-spin'), 8000);
@@ -1963,10 +2070,35 @@ const claimOnMyFunZoneWheel = guardLogin(async () => {
     return { status: 'timeout', message: '旋转结果超时，请手动确认' };
 });
 
+// 【修改 3】polishtorrent：A 分支收紧 isOnEventPage；过期回退 /spin；C 分支 disabled 时读上次奖励
 const claimOnPolishTorrentWheel = guardLogin(async () => {
+    // A) 活动详情页 → 先尝试活动；过期/无活动则回退 /spin
+    if (isOnEventPage()) {
+        const r = await handleMultiEventClaim();
+        if (r && ['inactive', 'notopen', 'skip'].includes(r.status) && !isNavigating(r)) {
+            location.href = location.origin + '/spin' + CLAIM_HASH;
+            return { status: 'navigating' };
+        }
+        return r;
+    }
+    // B) /events 列表页 → 找今日活动；无活动则去 /spin
+    if (location.pathname === '/events' || location.pathname === '/events/') {
+        const list = checkEventList(document, HOST);
+        if (list.paths && list.paths.length) {
+            if (list.paths.length > 1) setPendingEvents(HOST, list.paths);
+            location.href = location.origin + list.paths[0] + CLAIM_HASH;
+            return { status: 'navigating' };
+        }
+        location.href = location.origin + '/spin' + CLAIM_HASH;
+        return { status: 'navigating' };
+    }
+    // C) /spin 页面
     const btn = document.getElementById('spinBtn');
-    if (!btn) return { status: 'inactive', message: '未找到转盘按钮（可能已下线）' };
-    if (btn.disabled) return { status: 'already', message: '今日已领取' };
+    if (!btn) return { status: 'inactive', message: '未找到转盘按钮（页面结构可能已变化）' };
+    if (btn.disabled) {
+        const last = document.querySelector('.spin-already strong')?.textContent?.trim() || '';
+        return { status: 'already', message: last ? `今日已领取 · 上次：${last}` : '今日已领取' };
+    }
     const csrfToken = getCsrfToken();
     if (!csrfToken) return { status: 'failed', message: '未找到 CSRF Token' };
     try {
@@ -2009,6 +2141,15 @@ function dispatchHandler(cfg) {
     return fn ? fn(cfg) : navigateToUnit3DEventPage(cfg);
 }
 
+function maybeClearStaleLock() {
+    const lock = GM_getValue(TASK_LOCK_KEY, null);
+    if (!lock || !lock.ts) return;
+    const age = Date.now() - lock.ts;
+    if (age > TASK_LOCK_TTL) {
+        log(`[TaskLock] 清理过期锁（age=${Math.round(age / 1000)}s）`);
+        GM_deleteValue(TASK_LOCK_KEY);
+    }
+}
 /* ==========================================================================
    8. 调度层
    ========================================================================== */
@@ -2235,7 +2376,10 @@ async function startAutoScan(isAuto = false) {
     if (isAutoScanRunning || isSequentialRunning) return;
     const allTargets = getScanTargets(HOST).slice(0, AUTO_SCAN_CFG.maxPerRun);
     if (!allTargets.length) { GM_setValue(AUTO_SCAN_TIME_KEY, Date.now()); renderStats(); return; }
-    if (!tryAcquireTaskLock('autoScan')) return;
+    if (!tryAcquireTaskLock('autoScan')) {
+        showToast('⏳ 其它标签页任务运行中，请稍后再试');
+        return;
+    }
     isAutoScanRunning = true;
     renderStats(); toggleButtons(true);
     try {
@@ -2304,7 +2448,10 @@ async function startAutoScan(isAuto = false) {
 
 async function runSequential(hosts, { taskName, activeTab, pendingMessage, stateFlag }) {
     if (isSequentialRunning || isAutoScanRunning) return;
-    if (!tryAcquireTaskLock(taskName)) { alert('其它标签页任务运行中'); return; }
+    if (!tryAcquireTaskLock(taskName)) {
+        showToast('⏳ 其它标签页任务运行中，请稍后再试');
+        return;
+    }
     if (!hosts.length) { releaseTaskLock(); alert('没有需要处理的任务'); return; }
     stateFlag(true);
     renderStats(); toggleButtons(true);
@@ -2348,12 +2495,15 @@ function pickWorkHosts() {
 }
 function startAllSequential() {
     const hosts = pickWorkHosts();
-    if (!hosts.length) { alert('没有需要领取的活跃站点'); return; }
+    if (!hosts.length) { showToast('没有需要领取的活跃站点'); return; }
     runSequential(hosts, { taskName: 'sequential', activeTab: true, pendingMessage: '等待中...', stateFlag: v => { isSequentialRunning = v; } });
 }
 async function startAllParallel() {
     if (isSequentialRunning || isAutoScanRunning) { alert('其它任务正在运行中'); return; }
-    if (!tryAcquireTaskLock('parallel')) { alert('其它标签页任务运行中'); return; }
+    if (!tryAcquireTaskLock('parallel')) {
+        showToast('⏳ 其它标签页任务运行中，请稍后再试');
+        return;
+    }
     const hosts = pickWorkHosts();
     if (!hosts.length) { releaseTaskLock(); alert('没有需要领取的活跃站点'); return; }
     for (const host of hosts) setSiteStatus(host, { status: 'pending', message: '等待中...' });
@@ -2702,7 +2852,14 @@ function renderStats() {
                    ? ' · <span style="color:#9ccc65">南瓜: 已领</span>'
                    : ` · <span style="color:#ffb266">南瓜: ${STATUS_LABELS[pumpkinSt.status] || pumpkinSt.status}</span>`);
         parts.push(spinSummaryHtml('YUSCENE 转盘', GM_getValue(YUSCENE_SPIN_NEXT_KEY, 0)));
-        parts.push(spinSummaryHtml('FileList Spin', GM_getValue(FILELIST_SPIN_NEXT_KEY, 0)));
+                const filelistSt = getSiteStatus('filelist.io');
+        if (filelistSt.status === 'claimed' || filelistSt.status === 'already') {
+            parts.push(' · <span style="color:#9ccc65">FileList: 已领</span>');
+        } else if (filelistSt.status === 'inactive') {
+            parts.push(' · <span style="color:#7a6a5a">FileList: 无活动</span>');
+        } else {
+            parts.push(spinSummaryHtml('FileList Spin', GM_getValue(FILELIST_SPIN_NEXT_KEY, 0)));
+        }
         sum.innerHTML = `活跃进度：${done} / ${hosts.length} （${Math.round(pct)}%）${running}${scanning}${scanInfo}${parts.join('')}`;
     }
     const badge = document.getElementById('pt-active-badge');
@@ -2798,7 +2955,37 @@ async function runClaim() {
         setSiteStatus(HOST, r);
         return closeSelf();
     }
+    // 【修改 5】yu-scene 增加 /events 双分支：活动详情 → 领活动，过期回退转盘；/events 列表 → 找活动否则转盘
     if (HOST === 'yu-scene.net') {
+        // A) 活动详情页 → 先尝试活动；过期/无活动则回退 /prize-wheel
+        if (isOnEventPage()) {
+            const r = await handleMultiEventClaim();
+            if (r && ['inactive', 'notopen', 'skip'].includes(r.status) && !isNavigating(r)) {
+                if (yusceneWheelDone()) {
+                    setSiteStatus(HOST, { status: 'already', message: `活动已过期，今日转盘也已完成${r.message ? '（' + r.message + '）' : ''}` });
+                    return closeSelf();
+                }
+                setSiteStatus(HOST, { status: 'pending', message: '活动已过期，转去转盘...' });
+                location.href = location.origin + '/prize-wheel' + CLAIM_HASH;
+                return;
+            }
+            setSiteStatus(HOST, r);
+            return closeSelf();
+        }
+        // B) /events 列表页 → 找今日活动跳转；无活动则去 /prize-wheel
+        if (location.pathname === '/events' || location.pathname === '/events/') {
+            const list = checkEventList(document, HOST);
+            if (list.paths && list.paths.length) {
+                if (list.paths.length > 1) setPendingEvents(HOST, list.paths);
+                setSiteStatus(HOST, { status: 'pending', message: '前往今日活动...' });
+                location.href = location.origin + list.paths[0] + CLAIM_HASH;
+                return;
+            }
+            setSiteStatus(HOST, { status: 'pending', message: '无今日活动，转去转盘...' });
+            location.href = location.origin + '/prize-wheel' + CLAIM_HASH;
+            return;
+        }
+        // C) 转盘页 → 原逻辑
         if (location.pathname !== '/prize-wheel') {
             setSiteStatus(HOST, { status: 'pending', message: '导航到转盘页面...' });
             location.href = location.origin + '/prize-wheel' + CLAIM_HASH;
@@ -2832,6 +3019,7 @@ async function main() {
     if (HOST === 'samaritano.cc' || GM_getValue(DEBUG_NETLOG_KEY, false)) PTLog.installNetworkLog(W);
     checkDailyReset();
     cleanupStalePending();
+    maybeClearStaleLock();
     startSpinTimers();
     if (location.hash === DASHBOARD_HASH) { registerPanelEntry(); return renderDashboard(); }
     if (HOST === 'yu-scene.net' && location.hash === PUMPKIN_HASH) {
