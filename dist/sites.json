@@ -28,5 +28,6 @@
   "yu-scene.net":            { "handler": "yuscene_spinwheel", "rewardPath": "/prize-wheel" },
   "polishtorrent.top":       { "handler": "polishtorrent", "rewardPath": "/spin" },
   "myfunzone.org":           { "handler": "myfunzone", "rewardPath": "/wheel" },
-  "filelist.io":             { "handler": "filelist", "rewardPath": "/spin.php" }
+  "filelist.io":             { "handler": "filelist", "rewardPath": "/spin.php" },
+  "torrenthaven.org":        { "handler": "unit3d", "rewardPath": "/events", "rewardLinkText": ["Daily Reward", "FreeLeech Tokens", "Try To Win", "Claim"] }
 }
