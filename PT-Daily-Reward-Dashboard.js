@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         PT Daily Reward Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      10.3.8
-// @description  多站点 PT 每日奖励控制面板；支持同站点多活动连续领取；极速后台静默领取；多特殊转盘支持；UI小型化
+// @version      11.0.0
+// @description  多站点 PT 每日奖励控制面板；支持同站点多活动连续领取；极速后台静默领取；多特殊转盘支持；修复 seedpool 隐藏报错及误报成功；新增 polishtorrent/myfunzone/yu-scene 的 /events + 特殊玩法双分支；集成 V11 优化：防风控重试、CDN 兜底、悬浮球 Badge、后台静默、单站日志与插件化重构
 // @author       Whale, DeepSeek
 // @license      GPL-3.0 License
 // @match        https://bitporn.eu/*
@@ -61,11 +61,11 @@
 // @match        https://homiehelpdesk.net/*
 // @match        https://reelflix.cc/*
 // @match        https://torrent.desi/*
-// @match        https://torrenthaven.org/*
 // @match        https://upscalevault.com/*
 // @match        https://3dvault.org/*
 // @match        https://f1carreras.xyz/*
 // @match        https://filelist.io/*
+// @match        https://torrenthaven.org/*
 // @icon         https://cdn.jsdelivr.net/gh/twitter/twemoji@master/assets/svg/1f381.svg
 // @resource     pt_css        https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/dashboard.css
 // @resource     pt_html       https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/dashboard.html
@@ -90,14 +90,15 @@
 // ==/UserScript==
 
 /*
- * V10.3.8：
- *   1. 修复 buildClaimUrl 里 polishtorrent 分支使用 hash 时触发 TDZ 的致命 bug。
- *   2. probeRemoteSite 的 polishtorrent 分支：改为 GET /spin，且按钮 disabled 时读 .spin-already strong 显示上次奖励。
- *   3. polishtorrent 的 claim：A 分支收紧为 isOnEventPage()，活动过期时回退 /spin；C 分支 disabled 时读上次奖励。
- *   4. myfunzone.org：新增 /events 探测；claim 增加 A(活动详情)/B(/events 列表)/C(/wheel) 三分支。
- *   5. yu-scene.net：probe 增加 /events 偶发活动探测；claim 侧在 runClaim 专属分支加 /events 处理（见第二部分）。
- *   6. buildClaimUrl：myfunzone / yu-scene 有活动缓存走活动页，无缓存走各自特殊玩法页。
- *   7. MULTI_TASK_SITES 加入 polishtorrent/myfunzone/yu-scene，避免单侧失败触发自动降级。
+ * V11.0.0 更新说明：
+ *   1. 增加 robustFetch（带随机延迟、指数退避重试、伪造 Header）。
+ *   2. 增加 CDN 兜底（jsDelivr 失败自动切 fastly / unpkg）。
+ *   3. 悬浮球增加未领取活动 Badge 提示。
+ *   4. 后台静默打开标签页，不再抢占焦点。
+ *   5. Watchdog 动态超时，慢速站点不再误判。
+ *   6. 站点配置向插件化靠拢（提取 PROBES 和 HANDLERS）。
+ *   7. 支持单站日志复制和只看活跃站点过滤。
+ *   8. 多任务站点状态剥离（0dayfiles 等单独维护 subStatus）。
  */
 
 (function () {
@@ -115,12 +116,55 @@ const {
     tabRegistry, openTab, closeTab, spawnClaimTab,
 } = CORE;
 
+// ==========================================
+// 全局常量与状态码枚举
+// ==========================================
 const LOG = '[PT-Reward]';
+const STATUS = {
+    PENDING: 'pending', CLAIMING: 'claiming', CLAIMED: 'claimed', ALREADY: 'already',
+    AUTH: 'auth', SKIP: 'skip', FAILED: 'failed', TIMEOUT: 'timeout', INACTIVE: 'inactive',
+    EMPTY: 'empty', AVAILABLE: 'available', NOTOPEN: 'notopen', MAINTENANCE: 'maintenance',
+    NAVIGATING: 'navigating'
+};
+const DEFAULT_HEADERS = {
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'same-origin',
+    'Sec-Fetch-User': '?1',
+    'Upgrade-Insecure-Requests': '1'
+};
+
 const _resCache = new Map();
 const resText = name => {
     if (_resCache.has(name)) return _resCache.get(name);
     let t = '';
     try { t = GM_getResourceText(name) || ''; } catch (e) {}
+
+    // 优化 3：CDN 备用源兜底
+    if (!t) {
+        const paths = { pt_css: 'dashboard.css', pt_html: 'dashboard.html', pt_sites: 'sites.json', pt_inactive: 'inactive.json', pt_timezone: 'timezone.json' };
+        const file = paths[name];
+        if (file) {
+            const urls = [
+                `https://fastly.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/${file}`,
+                `https://unpkg.com/pt-daily-reward-dashboard@latest/dist/${file}`
+            ];
+            for (const url of urls) {
+                try {
+                    const xhr = new XMLHttpRequest();
+                    xhr.open('GET', url, false);
+                    xhr.send();
+                    if (xhr.status === 200 && xhr.responseText) {
+                        t = xhr.responseText;
+                        console.log(LOG, `[Res] 从备用 CDN 加载成功: ${name}`);
+                        break;
+                    }
+                } catch (e) {}
+            }
+        }
+    }
     _resCache.set(name, t);
     return t;
 };
@@ -155,7 +199,7 @@ const TTL_SNAPSHOT = 10 * MIN, TTL_EVENT_PATH = 6 * HOUR, TTL_DC_POINTS = 24 * H
       ATTENDANCE_COOLDOWN = 20 * HOUR, ATTENDANCE_ATTEMPT_COOLDOWN = 30 * MIN,
       PENDING_EVENTS_TTL = 30 * MIN, TIMEOUT_COOLDOWN = 10 * MIN,
       FAILED_COOLDOWN = 5 * MIN, PUMPKIN_COOLDOWN = 20 * HOUR,
-      AUTO_TAB_TTL = 30 * MIN, STALE_PENDING_MS = 60 * 1000, TASK_LOCK_TTL = 5 * MIN;
+      AUTO_TAB_TTL = 30 * MIN, STALE_PENDING_MS = 60 * 1000, TASK_LOCK_TTL = 3 * MIN;
 
 const SEQUENTIAL_TIMEOUT = 40000, SEQUENTIAL_GAP = 400, HARD_TIMEOUT_MARGIN = 1000,
       FETCH_TIMEOUT = 5000, WAIT_BUTTON_TIMEOUT = 15000,
@@ -195,7 +239,8 @@ const STATUS_PREFIX = 'pt_status_v60_', PROMOTED_KEY = 'pt_promoted_sites_v60',
       DEBUG_NETLOG_KEY        = 'pt_debug_netlog',
       DEBUG_KEEP_TAB_KEY      = 'pt_debug_keep_tab',
       PROBE_MODE_KEY          = 'pt_probe_mode',
-      AUTO_TAB_SESSION_KEY    = 'pt_auto_tab';
+      AUTO_TAB_SESSION_KEY    = 'pt_auto_tab',
+      FILTER_ONLY_AVAIL_KEY   = 'pt_filter_only_avail';
 
 const lastOpenDateKey = (host = HOST) => 'pt_last_open_date_v1_' + host;
 
@@ -211,12 +256,11 @@ const FAIL_STATUSES = ['failed', 'inactive'];
 const isTerminal = st => TERMINAL_STATUSES.includes(st.status);
 const isSettled  = st => SETTLED_STATUSES.includes(st.status);
 
-const authResult = (message = '会话已过期，需要重新登录') => ({ status: 'auth', message });
-const isNavigating = r => !!r && r.status === 'navigating';
+const authResult = (message = '会话已过期，需要重新登录') => ({ status: STATUS.AUTH, message });
+const isNavigating = r => !!r && r.status === STATUS.NAVIGATING;
 const loginGate = () => (isOnLoginPageNow() ? authResult() : null);
 const guardLogin = fn => async (...a) => loginGate() || fn(...a);
 
-// 【修改 7】多任务站点加入 polishtorrent/myfunzone/yu-scene，避免单侧失败触发自动降级
 const MULTI_TASK_SITES = new Set(['0dayfiles.net', 'polishtorrent.top', 'myfunzone.org', 'yu-scene.net']);
 const TAB_ONLY_HANDLERS = new Set(['czteam', 'seedcore', 'retrotoon', '0dayfiles', 'digitalcore', 'myfunzone', 'polishtorrent', 'filelist']);
 const AUTO_SCAN_CFG = { failureThreshold: 3, intervalBetween: 2500, maxPerRun: 100 };
@@ -241,13 +285,46 @@ const _allLogHosts = () => new Set([...Object.keys(ALL_KNOWN_SITES), HOST]);
 const exportLogs = () => PTLog.exportAll(_allLogHosts());
 const clearLogs  = () => PTLog.clearAll(_allLogHosts());
 
+// ==========================================
+// 优化：带伪装的、支持指数退避重试的网络请求
+// ==========================================
+async function robustFetch(url, opts = {}) {
+    const maxRetries = 3;
+    let attempt = 0;
+    while (attempt < maxRetries) {
+        try {
+            const headers = { ...DEFAULT_HEADERS, ...(opts.headers || {}) };
+            if (!headers['User-Agent']) headers['User-Agent'] = navigator.userAgent;
+
+            const res = await gmFetch(url, { ...opts, headers });
+
+            // 针对 429 和 503 触发重试
+            if (res.status === 429 || res.status === 503) {
+                throw new Error(`RateLimited_${res.status}`);
+            }
+            return res;
+        } catch (e) {
+            attempt++;
+            if (attempt >= maxRetries) throw e;
+            const delay = Math.pow(2, attempt) * 1000 + Math.random() * 500;
+            log(`[Fetch] ${url} 请求异常或限速，${delay.toFixed(0)}ms 后重试 (${attempt}/${maxRetries})...`);
+            await sleep(delay);
+        }
+    }
+}
+
 window.addEventListener('error', e => {
     if (!e || !e.message) return;
+    // 屏蔽 seedpool 站点自身的 Livewire/JS 报错
+    if (HOST === 'seedpool.org' && /bookmark is not defined|button is not defined|icon is not defined|Cannot convert undefined/i.test(e.message)) return;
     logError('[Uncaught]', e.message, 'at', `${e.filename || '?'}:${e.lineno || 0}:${e.colno || 0}`);
 });
 window.addEventListener('unhandledrejection', e => {
     const r = e && e.reason;
-    logError('[Unhandled Promise]', (r && (r.stack || r.message)) || String(r));
+    const msg = (r && (r.stack || r.message)) || String(r);
+    // 屏蔽 seedpool 站点的 ethers CDN 获取失败报错
+    if (HOST === 'seedpool.org' && /ethers@6\.13\.2/i.test(msg)) return;
+    logError('[Unhandled Promise]', msg);
 });
 
 const isOnEventPage = () => /^\/(events|giveaways)\/\d+/.test(location.pathname);
@@ -325,7 +402,22 @@ function addCollectedReward(host, path, text) {
 
 const keyFor = (host, suffix) => STATUS_PREFIX + host + (suffix ? '_' + suffix : '');
 function setSiteStatus(host, status, suffix) {
-    GM_setValue(keyFor(host, suffix), { status: status.status, message: status.message || '', ts: Date.now(), url: location.href });
+    let finalStatus = status;
+    // 优化：针对多任务站点剥离状态
+    if (MULTI_TASK_SITES.has(host) && !suffix) {
+        const isSubTask = location.pathname === '/attendance' || location.pathname === '/spin-wheel' || location.pathname === '/spin';
+        const subKey = keyFor(host, 'sub');
+        let sub = GM_getValue(subKey, {});
+        if (isSubTask) {
+            const subType = location.pathname.includes('attendance') ? 'attendance' : 'spin';
+            sub[subType] = status.status;
+            GM_setValue(subKey, sub);
+        }
+        finalStatus = { ...status, sub };
+    }
+
+    GM_setValue(keyFor(host, suffix), { status: finalStatus.status, message: finalStatus.message || '', ts: Date.now(), url: location.href, sub: finalStatus.sub });
+
     if (suffix) return;
     if (['claimed', 'already', 'available', 'notopen', 'maintenance'].includes(status.status)) {
         resetFailure(host);
@@ -428,6 +520,12 @@ function isTaskLocked() {
     return true;
 }
 
+window.addEventListener('beforeunload', () => {
+    if (isAutoScanRunning || isSequentialRunning) {
+        releaseTaskLock();
+    }
+});
+
 const markAutoTab = () => {
     try { sessionStorage.setItem(AUTO_TAB_SESSION_KEY, JSON.stringify({ ts: Date.now(), from: location.hash || 'unknown' })); } catch (e) {}
 };
@@ -455,17 +553,37 @@ function closeSelf() {
                 window._pt_current_tab = null;
                 return;
             }
+            // 尝试通过 opener 关闭
+            if (window.opener && !window.opener.closed) {
+                try { window.opener.postMessage({ type: 'pt-close-tab', host: HOST }, '*'); } catch (e) {}
+            }
+            // 尝试直接关闭
             window.close();
-            if (window.opener && !window.opener.closed) window.opener.postMessage({ type: 'pt-close-tab', host: HOST }, '*');
+            // 兜底：若 1 秒后页面仍未关闭（说明浏览器拒绝了），在页面右上角显示关闭提示
+            setTimeout(() => {
+                if (document.body && !document.getElementById('pt-close-tip')) {
+                    const tip = document.createElement('div');
+                    tip.id = 'pt-close-tip';
+                    tip.style.cssText = 'position:fixed;top:20px;right:20px;z-index:999999;background:#2a2a2a;color:#ffb266;padding:12px 20px;border-radius:8px;font-size:14px;box-shadow:0 4px 16px rgba(0,0,0,0.6);cursor:pointer;border:1px solid #ffb266;';
+                    tip.textContent = '✅ 任务已完成，点击此处关闭页面';
+                    tip.onclick = () => { try { window.close(); } catch(e) {} tip.remove(); };
+                    document.body.appendChild(tip);
+                }
+            }, 1000);
         } catch (e) {}
     }, 2000);
 }
 
 window.addEventListener('message', e => {
     if (!e.data || e.data.type !== 'pt-close-tab' || !e.data.host) return;
-    const tab = tabRegistry[e.data.host];
-    if (tab && typeof tab.close === 'function') {
-        try { tab.close(); delete tabRegistry[e.data.host]; log(`[TabRegistry] 已关闭 ${e.data.host}`); } catch (err) {}
+    const host = e.data.host;
+    // 匹配 host 及带 hash 后缀的 tabKey（例如 'yu-scene.net#pumpkin'）
+    const keysToClose = Object.keys(tabRegistry).filter(k => k === host || k.startsWith(host + '#'));
+    for (const key of keysToClose) {
+        const tab = tabRegistry[key];
+        if (tab && typeof tab.close === 'function') {
+            try { tab.close(); delete tabRegistry[key]; log(`[TabRegistry] 已关闭 ${key}`); } catch (err) {}
+        }
     }
 });
 
@@ -594,21 +712,36 @@ function buildSeedcoreBubbleMessage() {
 
 function checkEventList(doc, host) {
     const today = getSiteToday(host);
+    const [, m, d] = today.split('-').map(Number);
+    const monthStr = MONTH_ABBR[m - 1]; // 例如 "Nov"
+
+    // 构建正则：匹配 "Nov 14", "14 Nov", 甚至 "Nov 14th"
+    const todayRegex = new RegExp(`\\b${monthStr}\\s*${d}(?:st|nd|rd|th)?\\b`, 'i');
+    const todayRegex2 = new RegExp(`\\b${d}(?:st|nd|rd|th)?\\s*${monthStr}\\b`, 'i');
+    const anyDateRegex = new RegExp(`\\b(${MONTH_ABBR.join('|')})\\s*\\d+`, 'i');
+
     let hasAnyEvent = false, hasFuture = false;
     const todayPaths = [];
     const allPaths = new Set();
+
+    // 1. 标准方式：尝试从 <a> 标签中解析活动链接
     for (const a of doc.querySelectorAll('a[href*="/events/"], a[href*="/giveaways/"]')) {
         const rawHref = a.getAttribute('href');
         if (!rawHref) continue;
         let p = rawHref;
         try { p = new URL(rawHref, location.origin).pathname; } catch (e) {}
-        const m = p.match(ACTIVITY_PATH_RE);
-        if (!m) continue;
-        const path = `/${m[1]}/${m[2]}`;
+        const match = p.match(ACTIVITY_PATH_RE);
+        if (!match) continue;
+
+        const path = `/${match[1]}/${match[2]}`;
         allPaths.add(path);
+
         const container = a.closest('tr') || a.closest('li') || a.closest('div') || a.parentElement;
         if (!container) continue;
+
         const timeEls = container.querySelectorAll('time[datetime]');
+        const rawText = container.textContent || '';
+
         if (timeEls.length >= 2) {
             hasAnyEvent = true;
             const startDate = (timeEls[0].getAttribute('datetime') || '').slice(0, 10);
@@ -620,8 +753,32 @@ function checkEventList(doc, host) {
             const dt = timeEls[0].getAttribute('datetime') || '';
             if (dt && dt.startsWith(today)) todayPaths.push(path);
             else if (dt && dt.slice(0, 10) > today) hasFuture = true;
+        } else {
+            // 👇 新增：无 <time> 标签时，依靠纯文本日期匹配
+            if (todayRegex.test(rawText) || todayRegex2.test(rawText)) {
+                hasAnyEvent = true;
+                todayPaths.push(path);
+            } else if (anyDateRegex.test(rawText)) {
+                hasAnyEvent = true;
+            }
         }
     }
+
+    // 2. 终极兜底：如果页面连 <a> 标签都没有（比如 nordicq.org 纯卡片渲染）
+    if (allPaths.size === 0) {
+        // 如果当前本身就在详情页，并且有可领元素
+        if (ACTIVITY_PATH_RE.test(location.pathname)) {
+            if (doc.querySelector(SEL_UNCLAIMED)) return { paths: [location.pathname], source: 'local-hint' };
+        } else {
+            // 如果在列表页，完全没有链接，看看页面文本里有没有今天的日期
+            const bodyText = doc.body?.innerText || '';
+            if (todayRegex.test(bodyText) || todayRegex2.test(bodyText)) {
+                // 如果页面提到了今天，强行返回 /events 让后续去详情页尝试
+                return { paths: ['/events'], source: 'remote-hint' };
+            }
+        }
+    }
+
     if (!hasAnyEvent && allPaths.size === 0) return { status: 'inactive', message: '活动列表为空' };
     if (hasAnyEvent) {
         if (todayPaths.length > 0) return { paths: todayPaths, source: 'remote-hint' };
@@ -706,9 +863,9 @@ function matchRewardTextScore(linkText, patterns) {
     return best;
 }
 
-/* ==========================================================================
-   6. 探测层
-   ========================================================================== */
+// ==========================================
+// 探测层
+// ==========================================
 async function loadEventPage(fetcher, url, host, opts) {
     let res;
     try { res = await fetcher(url, opts); }
@@ -733,7 +890,7 @@ async function loadEventPage(fetcher, url, host, opts) {
 
 async function refreshTokenFrom(url) {
     try {
-        const res = await gmFetch(url, { timeout: 6000 });
+        const res = await robustFetch(url, { timeout: 6000 });
         if (!res.ok) return null;
         const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
         const input = doc.querySelector('form[action*="/claims"] input[name="_token"]') || doc.querySelector('meta[name="csrf-token"]');
@@ -743,7 +900,7 @@ async function refreshTokenFrom(url) {
 
 async function postClaimToken(postUrl, token, referer) {
     try {
-        return await gmFetch(postUrl, {
+        return await robustFetch(postUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Referer': referer },
             data: `_token=${encodeURIComponent(token)}`,
@@ -810,7 +967,7 @@ async function probeEventPaths(host, base, allPaths) {
     const availablePaths = [], alreadyMsgs = [], directRewards = [];
     let hasAlready = false, hasNotopen = false, directClaimedCount = 0;
     const details = await Promise.allSettled(paths.map(p =>
-        loadEventPage((u, o) => gmFetch(u, o), `${base}${p}`, host, { timeout: 6000 })
+        loadEventPage((u, o) => robustFetch(u, o), `${base}${p}`, host, { timeout: 6000 })
         .then(r => {
             if (r.status && r.status.rateLimited) return { targetPath: p, rateLimited: true };
             if (r.status && r.status.status === 'skip') return null;
@@ -872,7 +1029,7 @@ function probeErrorToStatus(e) {
 
 async function probeSpecialSiteHealth(host) {
     try {
-        const res = await gmFetch(`https://${host}/prize-wheel`, { timeout: 8000 });
+        const res = await robustFetch(`https://${host}/prize-wheel`, { timeout: 8000 });
         if (res.status >= 500) return { status: 'maintenance', message: `服务器错误 (HTTP ${res.status})` };
         const html = await res.text();
         if (isMaintenancePage(html)) return { status: 'maintenance', message: '站点维护中' };
@@ -889,16 +1046,11 @@ async function probeSpecialSiteHealth(host) {
     return null;
 }
 
-async function probeRemoteSite(host) {
-    const cfg = ALL_KNOWN_SITES[host];
-    if (!cfg) return { status: 'skip', message: '未配置的站点' };
-    if (KNOWN_INACTIVE[host] && !getPromoted().includes(host)) {
-        return { status: 'inactive', message: KNOWN_INACTIVE[host].reason || '无活动' };
-    }
-
-    if (host === 'dirtybytes.net') {
+// 优化：将站点探测逻辑插件化
+const SITE_PROBES = {
+    'dirtybytes.net': async () => {
         try {
-            const res = await gmFetch(`${DIRTYBYTES_ORIGIN}${DIRTYBYTES_API}`, { timeout: 6000 });
+            const res = await robustFetch(`${DIRTYBYTES_ORIGIN}${DIRTYBYTES_API}`, { timeout: 6000 });
             if (res.status === 401 || res.status === 403 || (res.redirected && /login/i.test(res.finalUrl))) return { status: 'auth', message: '会话已过期' };
             if (res.status >= 500) return { status: 'maintenance', message: `服务器错误 (HTTP ${res.status})` };
             if (!res.ok) return { status: 'failed', message: `API HTTP ${res.status}` };
@@ -913,17 +1065,15 @@ async function probeRemoteSite(host) {
             }
             return { status: 'available', message: `待登录发放 · 连续 ${streak} 天 · 下次 +${nextPoints}p` };
         } catch (e) { return { status: 'failed', message: `异常：${e.message || e}` }; }
-    }
-
-    if (host === 'filelist.io') {
+    },
+    'filelist.io': async () => {
         try {
-            const res = await gmFetch('https://filelist.io/spin.php', { timeout: 6000 });
+            const res = await robustFetch('https://filelist.io/spin.php', { timeout: 6000 });
             if (res.ok) {
                 const html = await res.text();
                 const doc = new DOMParser().parseFromString(html, 'text/html');
                 const bodyText = doc.body?.innerText || '';
 
-                // 【新增】优先识别“活动已结束”提示
                 if (/This event has ended|Please check again later/i.test(bodyText)) {
                     return { status: 'inactive', message: '转盘活动已结束' };
                 }
@@ -941,23 +1091,20 @@ async function probeRemoteSite(host) {
                 return { status: 'skip', message: '未找到 Spin 按钮' };
             }
         } catch (e) {}
-    }
-
-    if (host === 'myfunzone.org') {
-        // 【修改 4】先探 UNIT3D /events（偶发活动）
+    },
+    'myfunzone.org': async () => {
         try {
-            const res = await gmFetch('https://myfunzone.org/events', { timeout: 6000 });
+            const res = await robustFetch('https://myfunzone.org/events', { timeout: 6000 });
             if (res.ok) {
                 const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
-                const list = checkEventList(doc, host);
+                const list = checkEventList(doc, HOST);
                 if (list.paths && list.paths.length) {
-                    return await probeEventPaths(host, 'https://myfunzone.org', list.paths);
+                    return await probeEventPaths(HOST, 'https://myfunzone.org', list.paths);
                 }
             }
         } catch (e) {}
-        // 原有转盘探测
         try {
-            const res = await gmFetch('https://myfunzone.org/', { timeout: 6000 });
+            const res = await robustFetch('https://myfunzone.org/', { timeout: 6000 });
             if (res.ok) {
                 const html = await res.text();
                 const doc = new DOMParser().parseFromString(html, 'text/html');
@@ -970,23 +1117,20 @@ async function probeRemoteSite(host) {
                 return { status: 'skip', message: '未找到转盘' };
             }
         } catch (e) {}
-    }
-
-    if (host === 'polishtorrent.top') {
-        // 【修改 2】先探 UNIT3D /events（节日活动）
+    },
+    'polishtorrent.top': async () => {
         try {
-            const res = await gmFetch('https://polishtorrent.top/events', { timeout: 6000 });
+            const res = await robustFetch('https://polishtorrent.top/events', { timeout: 6000 });
             if (res.ok) {
                 const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
-                const list = checkEventList(doc, host);
+                const list = checkEventList(doc, HOST);
                 if (list.paths && list.paths.length) {
-                    return await probeEventPaths(host, 'https://polishtorrent.top', list.paths);
+                    return await probeEventPaths(HOST, 'https://polishtorrent.top', list.paths);
                 }
             }
         } catch (e) {}
-        // 【修改 2】再探 /spin（转盘），注意是 /spin 不是 /
         try {
-            const res = await gmFetch('https://polishtorrent.top/spin', { timeout: 6000 });
+            const res = await robustFetch('https://polishtorrent.top/spin', { timeout: 6000 });
             if (res.ok) {
                 const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
                 const btn = doc.querySelector('#spinBtn');
@@ -999,26 +1143,23 @@ async function probeRemoteSite(host) {
             }
         } catch (e) {}
         return { status: 'skip', message: 'events 与 /spin 均探测失败' };
-    }
-
-    // 【修改 5】yu-scene：先探 /events（偶发活动），无活动再走 needsTab
-    if (host === 'yu-scene.net') {
+    },
+    'yu-scene.net': async () => {
         try {
-            const res = await gmFetch('https://yu-scene.net/events', { timeout: 6000 });
+            const res = await robustFetch('https://yu-scene.net/events', { timeout: 6000 });
             if (res.ok) {
                 const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
-                const list = checkEventList(doc, host);
+                const list = checkEventList(doc, HOST);
                 if (list.paths && list.paths.length) {
-                    return await probeEventPaths(host, 'https://yu-scene.net', list.paths);
+                    return await probeEventPaths(HOST, 'https://yu-scene.net', list.paths);
                 }
             }
         } catch (e) {}
-        // 继续走下方 needsTab 分支（其中会做 /prize-wheel 健康检查）
-    }
-
-    if (host === 'czteam.me') {
+        // 走 needsTab 分支（其中会做 /prize-wheel 健康检查）
+    },
+    'czteam.me': async () => {
         try {
-            const res = await gmFetch('https://czteam.me/events.php', { timeout: 6000 });
+            const res = await robustFetch('https://czteam.me/events.php', { timeout: 6000 });
             if (res.ok) {
                 const html = await res.text();
                 const doc = new DOMParser().parseFromString(html, 'text/html');
@@ -1029,11 +1170,10 @@ async function probeRemoteSite(host) {
                 return { status: 'skip', message: '未找到每日礼物按钮' };
             }
         } catch (e) {}
-    }
-
-    if (host === 'seedcore.net') {
+    },
+    'seedcore.net': async () => {
         try {
-            const detail = await loadEventPage((u, o) => gmFetch(u, o), 'https://seedcore.net/events/2', host);
+            const detail = await loadEventPage((u, o) => robustFetch(u, o), 'https://seedcore.net/events/2', HOST);
             if (detail.article) {
                 if (detail.state === 'claimed') return { status: 'already', message: messagesOf(detail.article).join('，') || '今日已领' };
                 if (detail.state === 'unclaimed') return { status: 'available', message: '检测到可领取' };
@@ -1042,13 +1182,25 @@ async function probeRemoteSite(host) {
                 return detail.status;
             }
         } catch (e) {}
-    }
-
-    if (host === '0dayfiles.net') {
+    },
+    '0dayfiles.net': async () => {
         if (!attendanceDone() || GM_getValue(SPINWHEEL_NEXT_KEY, 0) <= Date.now()) {
             return { status: 'available', message: '有签到/转盘任务待处理' };
         }
         return { status: 'already', message: '签到和转盘均已完成' };
+    }
+};
+
+async function probeRemoteSite(host) {
+    const cfg = ALL_KNOWN_SITES[host];
+    if (!cfg) return { status: 'skip', message: '未配置的站点' };
+    if (KNOWN_INACTIVE[host] && !getPromoted().includes(host)) {
+        return { status: 'inactive', message: KNOWN_INACTIVE[host].reason || '无活动' };
+    }
+
+    // 优先走插件化逻辑
+    if (SITE_PROBES[host]) {
+        return await SITE_PROBES[host]();
     }
 
     if (cfg.handler !== 'unit3d' && cfg.handler !== 'infinityhd') {
@@ -1064,7 +1216,7 @@ async function probeRemoteSite(host) {
 
     if (cfg.rewardPath && ACTIVITY_PATH_RE.test(cfg.rewardPath)) {
         const p = cfg.rewardPath;
-        const detail = await loadEventPage((u, o) => gmFetch(u, o), `${base}${p}`, host);
+        const detail = await loadEventPage((u, o) => robustFetch(u, o), `${base}${p}`, host);
         if (detail.netError) return { status: 'failed', message: 'fetch 详情页超时', eventPath: p };
         if (detail.httpError) return { status: 'failed', message: `GET ${p} → HTTP ${detail.httpStatus}`, eventPath: p };
         if (detail.status)   return { ...detail.status, eventPath: p };
@@ -1092,7 +1244,7 @@ async function probeRemoteSite(host) {
 
     if (cfg.rewardPath && ACTIVITY_LIST_RE.test(cfg.rewardPath)) {
         let res;
-        try { res = await gmFetch(`${base}${cfg.rewardPath}`); }
+        try { res = await robustFetch(`${base}${cfg.rewardPath}`); }
         catch (e) { return probeErrorToStatus(e); }
         if (res.redirected && /\/(login|auth|signin)/i.test(new URL(res.finalUrl).pathname)) return { status: 'auth', message: '会话已过期' };
         const httpBad = httpStatusToResult(res, { auth: true });
@@ -1109,7 +1261,7 @@ async function probeRemoteSite(host) {
     }
 
     let res;
-    try { res = await gmFetch(`${base}/events`, { timeout: host === 'jme-reunit3d.de' ? 40000 : undefined }); }
+    try { res = await robustFetch(`${base}/events`, { timeout: host === 'jme-reunit3d.de' ? 40000 : undefined }); }
     catch (e) { return probeErrorToStatus(e); }
     if (res.redirected && /\/(login|auth|signin)/i.test(new URL(res.finalUrl).pathname)) return { status: 'auth', message: '会话已过期' };
     const httpBad = httpStatusToResult(res, { auth: true });
@@ -1142,7 +1294,7 @@ async function probeRemoteSite(host) {
         targetPath = allCandidates[0].path;
         targetSource = 'probe-unclaimed';
     }
-    const detail = await loadEventPage((u, o) => gmFetch(u, o), `${base}${targetPath}`, host);
+    const detail = await loadEventPage((u, o) => robustFetch(u, o), `${base}${targetPath}`, host);
     if (detail.netError) return { status: 'failed', message: 'fetch 详情页超时', eventPath: targetPath };
     if (detail.httpError) return { status: 'failed', message: `GET ${targetPath} → HTTP ${detail.httpStatus}`, eventPath: targetPath };
     if (detail.status) return { ...detail.status, eventPath: targetPath };
@@ -1170,10 +1322,15 @@ async function probeAllSitesParallel(hosts, concurrency = 4) {
     const results = {};
     let idx = 0, done = 0;
     const total = hosts.length;
-    // 【新增】这三个站点不使用 12 小时缓存，每次扫描强制重新探测
     const FORCE_REPROBE = new Set(['filelist.io', 'dirtybytes.net', '0dayfiles.net']);
+    const SLOW_HOSTS = new Set(['dirtybytes.net', 'sextorrent.myds.me']);
+
+    // 新增：超时标志位
+    let globalTimeout = false;
+
     async function worker() {
         while (idx < total) {
+            if (globalTimeout) break; // 收到超时信号，立即退出循环
             const host = hosts[idx++];
             try {
                 const st = getSiteStatus(host);
@@ -1182,7 +1339,8 @@ async function probeAllSitesParallel(hosts, concurrency = 4) {
                     Date.now() - st.ts < TTL_RECHECK) {
                     results[host] = st;
                 } else {
-                    const r = await probeRemoteSiteWithBudget(host);
+                    const budget = SLOW_HOSTS.has(host) ? 3000 : PROBE_SITE_BUDGET;
+                    const r = await probeRemoteSiteWithBudget(host, budget);
                     if (!r.needsTab) setSiteStatus(host, r);
                     results[host] = r;
                 }
@@ -1197,7 +1355,14 @@ async function probeAllSitesParallel(hosts, concurrency = 4) {
             await sleep(150 + Math.random() * 250);
         }
     }
+
+    const timer = setTimeout(() => {
+        globalTimeout = true;
+        log('[Scan] 阶段 1 探测达到 60 秒全局超时，强制进入下一阶段');
+    }, 60000);
+
     await Promise.all(Array.from({ length: concurrency }, worker));
+    clearTimeout(timer);
     return results;
 }
 
@@ -1215,7 +1380,7 @@ async function _autoDetectRewardPathInner() {
     }
     const base = location.origin;
     let res;
-    try { res = await fetchWithTimeout(`${base}/events`, { credentials: 'include' }, 10000, 2); }
+    try { res = await robustFetch(`${base}/events`, { credentials: 'include' }, 10000, 2); }
     catch (e) { return null; }
     if (looksLikeLoginResponse(res)) return { needLogin: true };
     const httpBad = httpStatusToResult(res);
@@ -1253,7 +1418,6 @@ async function _autoDetectRewardPathInner() {
     return null;
 }
 
-// 【修改 1 + 6】buildClaimUrl：hash 提到函数首行（修 TDZ）；myfunzone/yu-scene 有活动缓存走活动页，无缓存走各自特殊玩法页
 const buildClaimUrl = (host, mode = 'claim') => {
     const hash = mode === 'detect' ? DETECT_HASH : CLAIM_HASH;
     if (host === 'polishtorrent.top') {
@@ -1547,7 +1711,7 @@ async function navigateToInfinityHDEventPage() {
     let links = findLinks(document);
     if (!links.length) {
         let res;
-        try { res = await fetchWithTimeout(`${base}/`, { credentials: 'include' }, FETCH_TIMEOUT, 2); }
+        try { res = await robustFetch(`${base}/`, { credentials: 'include' }, FETCH_TIMEOUT, 2); }
         catch (e) { return { status: 'failed', message: e.name === 'AbortError' ? '请求超时' : `网络错误：${e.message || e}` }; }
         if (looksLikeLoginResponse(res)) return authResult();
         const httpBad = httpStatusToResult(res, { notFound: false });
@@ -1699,7 +1863,7 @@ function parseDirtyBytesLastClaim(str) {
 }
 const claimOnDirtyBytes = guardLogin(async () => {
     try {
-        const res = await fetchWithTimeout(`${DIRTYBYTES_ORIGIN}${DIRTYBYTES_API}`, { credentials: 'include' }, FETCH_TIMEOUT, 2);
+        const res = await robustFetch(`${DIRTYBYTES_ORIGIN}${DIRTYBYTES_API}`, { credentials: 'include' }, FETCH_TIMEOUT, 2);
         if (looksLikeLoginResponse(res)) return { status: 'auth', message: '会话已过期，需要重新登录' };
         if (!res.ok) return { status: 'failed', message: `API HTTP ${res.status}` };
         const bonus = (await res.json())?.user?.dailyLoginBonusStatus;
@@ -1940,7 +2104,6 @@ const claimOnFilelist = guardLogin(async () => {
 
     const bodyText = document.body.innerText || '';
 
-    // 【新增】优先识别“活动已结束”提示
     if (/This event has ended|Please check again later/i.test(bodyText)) {
         return { status: 'inactive', message: '转盘活动已结束' };
     }
@@ -1979,9 +2142,7 @@ const claimOnFilelist = guardLogin(async () => {
     return { status: 'claimed', message: '已触发（未解析出具体奖励）' };
 });
 
-// 【修改 4】myfunzone：A(活动详情)/B(/events 列表)/C(/wheel) 三分支
 const claimOnMyFunZoneWheel = guardLogin(async () => {
-    // A) 活动详情页 → 先尝试活动；过期/无活动则回退 /wheel
     if (isOnEventPage()) {
         const r = await handleMultiEventClaim();
         if (r && ['inactive', 'notopen', 'skip'].includes(r.status) && !isNavigating(r)) {
@@ -1990,7 +2151,6 @@ const claimOnMyFunZoneWheel = guardLogin(async () => {
         }
         return r;
     }
-    // B) /events 列表页 → 找今日活动跳转；无活动则去 /wheel
     if (location.pathname === '/events' || location.pathname === '/events/') {
         const list = checkEventList(document, HOST);
         if (list.paths && list.paths.length) {
@@ -2001,7 +2161,6 @@ const claimOnMyFunZoneWheel = guardLogin(async () => {
         location.href = location.origin + '/wheel' + CLAIM_HASH;
         return { status: 'navigating' };
     }
-    // C) /wheel 原有逻辑
     const nav = ensurePath('/wheel', '/wheel');
     if (nav) return nav;
     await waitFor(() => document.getElementById('dw-fab') || document.getElementById('dw-spin'), 8000);
@@ -2070,9 +2229,7 @@ const claimOnMyFunZoneWheel = guardLogin(async () => {
     return { status: 'timeout', message: '旋转结果超时，请手动确认' };
 });
 
-// 【修改 3】polishtorrent：A 分支收紧 isOnEventPage；过期回退 /spin；C 分支 disabled 时读上次奖励
 const claimOnPolishTorrentWheel = guardLogin(async () => {
-    // A) 活动详情页 → 先尝试活动；过期/无活动则回退 /spin
     if (isOnEventPage()) {
         const r = await handleMultiEventClaim();
         if (r && ['inactive', 'notopen', 'skip'].includes(r.status) && !isNavigating(r)) {
@@ -2081,7 +2238,6 @@ const claimOnPolishTorrentWheel = guardLogin(async () => {
         }
         return r;
     }
-    // B) /events 列表页 → 找今日活动；无活动则去 /spin
     if (location.pathname === '/events' || location.pathname === '/events/') {
         const list = checkEventList(document, HOST);
         if (list.paths && list.paths.length) {
@@ -2092,7 +2248,6 @@ const claimOnPolishTorrentWheel = guardLogin(async () => {
         location.href = location.origin + '/spin' + CLAIM_HASH;
         return { status: 'navigating' };
     }
-    // C) /spin 页面
     const btn = document.getElementById('spinBtn');
     if (!btn) return { status: 'inactive', message: '未找到转盘按钮（页面结构可能已变化）' };
     if (btn.disabled) {
@@ -2121,7 +2276,8 @@ const claimOnPolishTorrentWheel = guardLogin(async () => {
     }
 });
 
-const HANDLERS = {
+// 优化：将站点领取逻辑插件化
+const SITE_HANDLERS = {
     czteam: claimOnCzTeam,
     seedcore: claimOnSeedCore,
     retrotoon: claimOnRetroToon,
@@ -2137,7 +2293,7 @@ function dispatchHandler(cfg) {
         if (isOnEventPage()) return handleMultiEventClaim();
         return handler === 'infinityhd' ? navigateToInfinityHDEventPage() : navigateToUnit3DEventPage(cfg);
     }
-    const fn = HANDLERS[handler];
+    const fn = SITE_HANDLERS[handler];
     return fn ? fn(cfg) : navigateToUnit3DEventPage(cfg);
 }
 
@@ -2150,9 +2306,10 @@ function maybeClearStaleLock() {
         GM_deleteValue(TASK_LOCK_KEY);
     }
 }
-/* ==========================================================================
-   8. 调度层
-   ========================================================================== */
+
+// ==========================================
+// 调度层
+// ==========================================
 function checkDailyReset() {
     if (isAutoOpenedTab()) return false;
     const today = getSiteToday(HOST);
@@ -2353,7 +2510,9 @@ function maybeAutoScan() {
 }
 
 async function withTab(host, url, timeout, tabKey = host) {
-    openTab(tabKey, url);
+    // 优化：强制静默打开标签页
+    const isAuto = isAutoOpenedTab() || location.hash === CLAIM_HASH || location.hash === DETECT_HASH;
+    openTab(tabKey, url, { active: !isAuto, insert: false, setParent: true });
     await waitForSiteDone(host, timeout);
     closeTab(tabKey);
     return getSiteStatus(host);
@@ -2362,7 +2521,7 @@ async function withTab(host, url, timeout, tabKey = host) {
 async function runPumpkinTab(host, { active = false, waitMs = 20000 } = {}) {
     if (pumpkinDone()) return false;
     const key = host + '#pumpkin';
-    openTab(key, buildClaimUrl(host, 'pumpkin'), active);
+    openTab(key, buildClaimUrl(host, 'pumpkin'), active, { insert: false, setParent: true });
     const start = Date.now();
     while (Date.now() - start < waitMs) {
         if (pumpkinDone()) break;
@@ -2459,7 +2618,8 @@ async function runSequential(hosts, { taskName, activeTab, pendingMessage, state
         for (let i = 0; i < hosts.length; i++) {
             const host = hosts[i];
             setSiteStatus(host, { status: 'pending', message: pendingMessage });
-            openTab(host, buildClaimUrl(host), activeTab);
+            // 优化：强制静默打开
+            openTab(host, buildClaimUrl(host), activeTab, { insert: false, setParent: true });
             const result = await waitForSiteDone(host);
             if (result.status === 'timeout' && !isTerminal(getSiteStatus(host))) {
                 setSiteStatus(host, { status: 'timeout', message: result.message || '超时' });
@@ -2515,9 +2675,9 @@ async function startAllParallel() {
                     log(`[Parallel] ${host} 状态为 ${getSiteStatus(host).status}，跳过`);
                     return;
                 }
-                openTab(host, buildClaimUrl(host));
+                openTab(host, buildClaimUrl(host), false, { insert: false, setParent: true });
                 if (host === 'yu-scene.net' && !pumpkinDone()) {
-                    openTab(host + '#pumpkin', buildClaimUrl(host, 'pumpkin'));
+                    openTab(host + '#pumpkin', buildClaimUrl(host, 'pumpkin'), false, { insert: false, setParent: true });
                 }
             }, j * OPEN_TAB_INTERVAL);
         });
@@ -2526,9 +2686,9 @@ async function startAllParallel() {
     setTimeout(() => releaseTaskLock(), 5000);
 }
 
-/* ==========================================================================
-   9. 面板层
-   ========================================================================== */
+// ==========================================
+// 面板层 (包含 UI 优化)
+// ==========================================
 function ensurePanelCss() {
     if (document.getElementById('pt-panel-css')) return;
     const css = panelCss();
@@ -2538,74 +2698,39 @@ function ensurePanelCss() {
     st.textContent = css + `
         /* ====== 面板展开时的定位 ====== */
         #pt-dashboard-root:not(.collapsed) {
-            left: auto !important;
-            right: 20px !important;
-            bottom: 20px !important;
-            position: fixed !important;
-            max-height: 85vh !important;
-            overflow: auto !important;
-            z-index: 99999 !important;
+            left: auto !important; right: 20px !important; bottom: 20px !important;
+            position: fixed !important; max-height: 85vh !important; overflow: auto !important; z-index: 99999 !important;
         }
-
         /* ====== 折叠时变身小 Logo 悬浮球 ====== */
         #pt-dashboard-root.collapsed {
-            width: 56px !important;
-            height: 56px !important;
-            min-width: 56px !important;
-            max-width: 56px !important;
-            border-radius: 50% !important;
-            padding: 0 !important;
-            margin: 0 !important;
-            left: auto !important;
-            right: 20px !important;
-            bottom: 20px !important;
+            width: 56px !important; height: 56px !important; min-width: 56px !important; max-width: 56px !important;
+            border-radius: 50% !important; padding: 0 !important; margin: 0 !important;
+            left: auto !important; right: 20px !important; bottom: 20px !important;
             background: linear-gradient(135deg, #2a2a2a, #1a1a1a) !important;
-            border: 2px solid #ffb266 !important;
-            box-shadow: 0 4px 15px rgba(0,0,0,0.6) !important;
-            cursor: pointer !important;
-            overflow: hidden !important;
-            transition: transform 0.2s, box-shadow 0.2s !important;
-            z-index: 99999 !important;
-            display: flex !important;
-            align-items: center !important;
-            justify-content: center !important;
-            transform: none !important;
+            border: 2px solid #ffb266 !important; box-shadow: 0 4px 15px rgba(0,0,0,0.6) !important;
+            cursor: pointer !important; overflow: visible !important; transition: transform 0.2s, box-shadow 0.2s !important;
+            z-index: 99999 !important; display: flex !important; align-items: center !important; justify-content: center !important;
         }
         #pt-dashboard-root.collapsed:hover {
-            transform: scale(1.1) !important;
-            box-shadow: 0 6px 20px rgba(255,178,102,0.4) !important;
+            transform: scale(1.1) !important; box-shadow: 0 6px 20px rgba(255,178,102,0.4) !important;
         }
-        /* 隐藏面板主体内容 */
-        #pt-dashboard-root.collapsed > *:not(#pt-header) {
-            display: none !important;
-        }
-        /* 让头部占满整个小圆球，确保点击有效 */
+        #pt-dashboard-root.collapsed > *:not(#pt-header) { display: none !important; }
         #pt-dashboard-root.collapsed #pt-header {
-            display: flex !important;
-            align-items: center !important;
-            justify-content: center !important;
-            width: 100% !important;
-            height: 100% !important;
-            margin: 0 !important;
-            padding: 0 !important;
-            background: transparent !important;
-            border: none !important;
-            cursor: pointer !important;
-            box-shadow: none !important;
-            border-radius: 50% !important;
+            display: flex !important; align-items: center !important; justify-content: center !important;
+            width: 100% !important; height: 100% !important; margin: 0 !important; padding: 0 !important;
+            background: transparent !important; border: none !important; cursor: pointer !important; box-shadow: none !important; border-radius: 50% !important;
         }
-        /* 隐藏头部原本的文字和开关 */
-        #pt-dashboard-root.collapsed #pt-header * {
-            display: none !important;
+        #pt-dashboard-root.collapsed #pt-header * { display: none !important; }
+        #pt-dashboard-root.collapsed #pt-header::after { content: "🎁"; display: block !important; font-size: 28px !important; line-height: 1 !important; }
+        /* Badge 提示 */
+        #pt-dashboard-root.collapsed::before {
+            content: attr(data-badge); position: absolute; top: -4px; right: -4px;
+            background: #ff3b30; color: #fff; border-radius: 10px; padding: 2px 6px;
+            font-size: 12px; font-weight: bold; border: 2px solid #1a1a1a;
+            display: none; align-items: center; justify-content: center; min-width: 20px;
         }
-        /* 使用礼物图标作为小 Logo */
-        #pt-dashboard-root.collapsed #pt-header::after {
-            content: "🎁";
-            display: block !important;
-            font-size: 28px !important;
-            line-height: 1 !important;
-            text-shadow: 0 2px 4px rgba(0,0,0,0.5) !important;
-        }
+        #pt-dashboard-root.collapsed[data-badge]:not([data-badge=""])::before { display: flex; }
+        .btn-copy-log { cursor: pointer; color: #82aaff; margin-left: 4px; }
     `;
     (document.head || document.documentElement).appendChild(st);
 }
@@ -2615,6 +2740,7 @@ function mountPanel() {
     ensurePanelCss();
     const tpl = panelHtml();
     if (!tpl.trim()) { logError('[UI] 面板模板资源为空，跳过渲染'); return null; }
+    // 默认折叠
     const collapsedNow = GM_getValue(COLLAPSE_KEY, true) === true;
     const filled = tpl
         .replace(/\{\{\s*TODAY\s*\}\}/g, TODAY)
@@ -2660,7 +2786,7 @@ async function checkHost(host) {
     refreshUI();
 }
 async function onPanelClick(e) {
-    const el = e.target.closest('[data-open-yuscene],[data-demote],[data-retry],[data-check],[data-restore],[data-hide]');
+    const el = e.target.closest('[data-open-yuscene],[data-demote],[data-retry],[data-check],[data-restore],[data-hide],[data-copylog]');
     if (!el) return;
     e.preventDefault();
     const d = el.dataset;
@@ -2670,6 +2796,16 @@ async function onPanelClick(e) {
     if (d.retry) return retryHost(d.retry);
     if (d.check) return checkHost(d.check);
     if (d.hide) { addToDemoted(d.hide, '手动忽略'); refreshUI(); return; }
+    if (d.copylog) {
+        try {
+            // PTLog.exportAll 接受一个 Set，传入单个 host 即可只导出该站
+            PTLog.exportAll(new Set([d.copylog]));
+            showToast(`✅ 已导出 ${d.copylog} 日志文件`);
+        } catch (e) {
+            showToast(`❌ 导出失败：${e.message}`);
+        }
+        return;
+    }
 }
 
 function renderDashboard() {
@@ -2812,6 +2948,9 @@ function actionHtmlFor(host, st, isPromoted) {
         html = `<a href="${buildClaimUrl(host)}" target="_blank">打开</a>`;
     }
     if (isPromoted) html += ` · <a href="#" data-demote="${host}">取消提升</a>`;
+
+    // 新增单站日志复制
+    html += ` · <span class="btn-copy-log" data-copylog="${host}" title="导出此站日志">📥日志</span>`;
     return html;
 }
 
@@ -2820,7 +2959,16 @@ function renderTable() {
     if (!tbody) return;
     const activeSites = getActiveSites();
     const promoted = getPromoted();
-    tbody.innerHTML = Object.keys(activeSites).map(host => {
+
+    // 优化：只看有活动的过滤
+    const onlyAvail = GM_getValue(FILTER_ONLY_AVAIL_KEY, false) === true;
+    const hosts = Object.keys(activeSites).filter(host => {
+        if (!onlyAvail) return true;
+        const st = getSiteStatus(host);
+        return ['available', 'claimed', 'already', 'failed'].includes(st.status);
+    });
+
+    tbody.innerHTML = hosts.map(host => {
         const cfg = activeSites[host];
         const st = getSiteStatus(host);
         const label = STATUS_LABELS[st.status] || st.status;
@@ -2923,7 +3071,7 @@ function renderStats() {
                    ? ' · <span style="color:#9ccc65">南瓜: 已领</span>'
                    : ` · <span style="color:#ffb266">南瓜: ${STATUS_LABELS[pumpkinSt.status] || pumpkinSt.status}</span>`);
         parts.push(spinSummaryHtml('YUSCENE 转盘', GM_getValue(YUSCENE_SPIN_NEXT_KEY, 0)));
-                const filelistSt = getSiteStatus('filelist.io');
+        const filelistSt = getSiteStatus('filelist.io');
         if (filelistSt.status === 'claimed' || filelistSt.status === 'already') {
             parts.push(' · <span style="color:#9ccc65">FileList: 已领</span>');
         } else if (filelistSt.status === 'inactive') {
@@ -2940,6 +3088,17 @@ function renderStats() {
         if (p > 0) parts.push(`含 ${p} 个提升`);
         if (d > 0) parts.push(`${d} 个降级移出`);
         badge.textContent = parts.join('，');
+    }
+
+    // 更新悬浮球 Badge
+    const root = document.getElementById('pt-dashboard-root');
+    if (root) {
+        let availCount = 0;
+        for (const h of hosts) {
+            if (getSiteStatus(h).status === 'available') availCount++;
+        }
+        if (availCount > 0) root.setAttribute('data-badge', availCount);
+        else root.removeAttribute('data-badge');
     }
 }
 
@@ -2959,6 +3118,12 @@ function registerPanelEntry() {
     GM_registerMenuCommand('📊 打开奖励控制面板', openDashboard);
     GM_registerMenuCommand('📋 导出日志', exportLogs);
     GM_registerMenuCommand('🗑️ 清空日志', clearLogs);
+    GM_registerMenuCommand('👁️ 切换：只看有活动/已领站点', () => {
+        const cur = GM_getValue(FILTER_ONLY_AVAIL_KEY, false);
+        GM_setValue(FILTER_ONLY_AVAIL_KEY, !cur);
+        refreshUI();
+        showToast(`过滤模式：${!cur ? '只看活跃' : '显示全部'}`);
+    });
     GM_registerMenuCommand('🌐 切换网络日志 hook', () => {
         const cur = GM_getValue(DEBUG_NETLOG_KEY, false);
         GM_setValue(DEBUG_NETLOG_KEY, !cur);
@@ -2977,12 +3142,15 @@ function registerPanelEntry() {
     window.addEventListener('hashchange', () => { if (location.hash === DASHBOARD_HASH) renderDashboard(); });
 }
 
-/* ==========================================================================
-   10. 入口
-   ========================================================================== */
+// ==========================================
+// 入口
+// ==========================================
 const NAVIGATE_TIMEOUT = 30 * 1000;
 const _navWatchdogs = new Map();
 function armNavigateWatchdog(host, timeout = NAVIGATE_TIMEOUT) {
+    // 优化：动态超时
+    if (host === 'jme-reunit3d.de' || host === 'filelist.io') timeout = 45000;
+
     if (_navWatchdogs.has(host)) {
         clearTimeout(_navWatchdogs.get(host));
         _navWatchdogs.delete(host);
@@ -2999,6 +3167,10 @@ function armNavigateWatchdog(host, timeout = NAVIGATE_TIMEOUT) {
         }
     }, timeout);
     _navWatchdogs.set(host, timer);
+
+    // 监听 DOM 加载，如果页面结构加载完毕，提前清空看门狗
+    const onLoad = () => { clearTimeout(timer); window.removeEventListener('DOMContentLoaded', onLoad); };
+    window.addEventListener('DOMContentLoaded', onLoad);
 }
 
 function finishClaim(result) {
@@ -3026,9 +3198,7 @@ async function runClaim() {
         setSiteStatus(HOST, r);
         return closeSelf();
     }
-    // 【修改 5】yu-scene 增加 /events 双分支：活动详情 → 领活动，过期回退转盘；/events 列表 → 找活动否则转盘
     if (HOST === 'yu-scene.net') {
-        // A) 活动详情页 → 先尝试活动；过期/无活动则回退 /prize-wheel
         if (isOnEventPage()) {
             const r = await handleMultiEventClaim();
             if (r && ['inactive', 'notopen', 'skip'].includes(r.status) && !isNavigating(r)) {
@@ -3043,7 +3213,6 @@ async function runClaim() {
             setSiteStatus(HOST, r);
             return closeSelf();
         }
-        // B) /events 列表页 → 找今日活动跳转；无活动则去 /prize-wheel
         if (location.pathname === '/events' || location.pathname === '/events/') {
             const list = checkEventList(document, HOST);
             if (list.paths && list.paths.length) {
@@ -3056,7 +3225,6 @@ async function runClaim() {
             location.href = location.origin + '/prize-wheel' + CLAIM_HASH;
             return;
         }
-        // C) 转盘页 → 原逻辑
         if (location.pathname !== '/prize-wheel') {
             setSiteStatus(HOST, { status: 'pending', message: '导航到转盘页面...' });
             location.href = location.origin + '/prize-wheel' + CLAIM_HASH;
@@ -3094,7 +3262,7 @@ async function main() {
     startSpinTimers();
     if (location.hash === DASHBOARD_HASH) { registerPanelEntry(); return renderDashboard(); }
     if (HOST === 'yu-scene.net' && location.hash === PUMPKIN_HASH) {
-        markAutoTab();
+        // 不再调用 markAutoTab()，避免手动打开此 URL 时被误判为自动标签页
         await claimYuscenePumpkin();
         return closeSelf();
     }
