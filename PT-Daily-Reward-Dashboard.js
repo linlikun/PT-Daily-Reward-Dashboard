@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PT Daily Reward Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      11.0.0
+// @version      11.0.1
 // @description  多站点 PT 每日奖励控制面板；支持同站点多活动连续领取；极速后台静默领取；多特殊转盘支持；修复 seedpool 隐藏报错及误报成功；新增 polishtorrent/myfunzone/yu-scene 的 /events + 特殊玩法双分支；集成 V11 优化：防风控重试、CDN 兜底、悬浮球 Badge、后台静默、单站日志与插件化重构
 // @author       Whale, DeepSeek
 // @license      GPL-3.0 License
@@ -66,6 +66,7 @@
 // @match        https://f1carreras.xyz/*
 // @match        https://filelist.io/*
 // @match        https://torrenthaven.org/*
+// @match        https://v3x.club/*
 // @icon         https://cdn.jsdelivr.net/gh/twitter/twemoji@master/assets/svg/1f381.svg
 // @resource     pt_css        https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/dashboard.css
 // @resource     pt_html       https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/dashboard.html
@@ -1048,6 +1049,58 @@ async function probeSpecialSiteHealth(host) {
 
 // 优化：将站点探测逻辑插件化
 const SITE_PROBES = {
+    'v3x.club': async () => {
+        try {
+            let isClaimed = false;
+            let messages = [];
+
+            // 第一步：签到
+            const dailyRes = await robustFetch('https://api.v3x.club/me/daily/claim-login', {
+                method: 'POST',
+                credentials: 'include',
+                headers: { 'Accept': '*/*', 'Origin': 'https://v3x.club', 'Referer': 'https://v3x.club/' }
+            });
+            if (dailyRes.status === 401 || dailyRes.status === 403) return { status: 'auth', message: '需要登录' };
+
+            if (dailyRes.status === 200 || dailyRes.status === 204) {
+                messages.push('签到成功');
+                isClaimed = true;
+            } else if (dailyRes.status === 400 || dailyRes.status === 409) {
+                messages.push('签到已领');
+            } else {
+                messages.push(`签到异常(${dailyRes.status})`);
+            }
+
+            // 第二步：转盘
+            const wheelRes = await robustFetch('https://api.v3x.club/me/wheel/spin', {
+                method: 'POST',
+                credentials: 'include',
+                headers: { 'Accept': '*/*', 'Origin': 'https://v3x.club', 'Referer': 'https://v3x.club/' }
+            });
+
+            if (wheelRes.status === 200) {
+                const wheelData = await wheelRes.json();
+                if (wheelData.ok) {
+                    messages.push(`转盘+${wheelData.reward}`);
+                    isClaimed = true;
+                } else {
+                    messages.push('转盘已转');
+                }
+            } else if (wheelRes.status === 400 || wheelRes.status === 409) {
+                messages.push('转盘已转');
+            } else {
+                messages.push(`转盘异常(${wheelRes.status})`);
+            }
+
+            const finalMsg = messages.join('，');
+            // 只要签到或转盘有任何一个成功，状态就是 claimed
+            return { status: isClaimed ? 'claimed' : 'already', message: finalMsg };
+
+        } catch (e) {
+            return { status: 'failed', message: `异常：${e.message}` };
+        }
+    },
+
     'dirtybytes.net': async () => {
         try {
             const res = await robustFetch(`${DIRTYBYTES_ORIGIN}${DIRTYBYTES_API}`, { timeout: 6000 });
@@ -2521,6 +2574,7 @@ async function withTab(host, url, timeout, tabKey = host) {
 async function runPumpkinTab(host, { active = false, waitMs = 20000 } = {}) {
     if (pumpkinDone()) return false;
     const key = host + '#pumpkin';
+    closeTab(key); // 👈 新增：打开前先强制清理可能残留的旧标签页
     openTab(key, buildClaimUrl(host, 'pumpkin'), active, { insert: false, setParent: true });
     const start = Date.now();
     while (Date.now() - start < waitMs) {
@@ -3262,7 +3316,7 @@ async function main() {
     startSpinTimers();
     if (location.hash === DASHBOARD_HASH) { registerPanelEntry(); return renderDashboard(); }
     if (HOST === 'yu-scene.net' && location.hash === PUMPKIN_HASH) {
-        // 不再调用 markAutoTab()，避免手动打开此 URL 时被误判为自动标签页
+        markAutoTab(); // 直接标记，不废话
         await claimYuscenePumpkin();
         return closeSelf();
     }
