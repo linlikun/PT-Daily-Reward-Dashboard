@@ -56,5 +56,6 @@
   "darkpeers.org":           { "handler": "unit3d" },
   "3dvault.org":             { "handler": "unit3d" },
   "f1carreras.xyz":          { "handler": "unit3d" },
+  "v3x.club":                { "handler": "unit3d" },
   "gemini-tracker.org":      { "handler": "unit3d" }
 }
