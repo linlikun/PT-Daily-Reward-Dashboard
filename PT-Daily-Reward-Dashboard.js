@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PT Daily Reward Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      11.0.2
+// @version      11.0.5
 // @description  多站点 PT 每日奖励控制面板；支持同站点多活动连续领取；极速后台静默领取；多特殊转盘支持；修复 seedpool 隐藏报错及误报成功；新增 polishtorrent/myfunzone/yu-scene 的 /events + 特殊玩法双分支；集成 V11 优化：防风控重试、CDN 兜底、悬浮球 Badge、后台静默、单站日志与插件化重构
 // @author       Whale, DeepSeek
 // @license      GPL-3.0 License
@@ -166,7 +166,7 @@ const resText = name => {
             }
         }
     }
-    _resCache.set(name, t);
+    if (t) _resCache.set(name, t); // 失败不缓存，下次调用可重试
     return t;
 };
 const resJson = (name, dflt) => {
@@ -176,8 +176,27 @@ const resJson = (name, dflt) => {
     catch (e) { console.error(LOG, `[Res] 解析 ${name} 失败`, e.message); return dflt; }
 };
 
-const SITES           = resJson('pt_sites', {});
+// 站点表来自 CDN，这里加一层本地覆盖：域名迁移、维护暂停不必等 CDN 更新
+const SITE_OVERRIDES = {
+    // emuwarez 2026-11 换域名：旧域名下线，新域名沿用 unit3d 的 /events
+    'emuwarez.com': null,
+    'emu-warez.com': { handler: 'unit3d', rewardPath: '/events' },
+};
+// 维护中站点：until 之前完全不探测（不占扫描时间、不计失败），到期自动回到常规探测
+const SITE_PAUSED = {
+    'oldtoons.world': { reason: '站点维护中（修复 PHP 漏洞）', until: Date.parse('2026-11-26T00:00:00+08:00') },
+};
+const SITES_RAW       = resJson('pt_sites', {});
+const SITES           = (() => {
+    const out = { ...SITES_RAW };
+    for (const [h, cfg] of Object.entries(SITE_OVERRIDES)) {
+        if (cfg === null) delete out[h];
+        else out[h] = { ...(out[h] || {}), ...cfg };
+    }
+    return out;
+})();
 const KNOWN_INACTIVE  = resJson('pt_inactive', {});
+for (const [h, cfg] of Object.entries(SITE_OVERRIDES)) if (cfg === null) delete KNOWN_INACTIVE[h];
 const SITE_TIMEZONE   = resJson('pt_timezone', {});
 const ALL_KNOWN_SITES = { ...SITES, ...KNOWN_INACTIVE };
 const panelCss  = () => resText('pt_css');
@@ -235,13 +254,15 @@ const STATUS_PREFIX = 'pt_status_v60_', PROMOTED_KEY = 'pt_promoted_sites_v60',
       PUMPKIN_LAST_CLAIM_KEY  = 'pt_pumpkin_last_claim_v1',
       PUMPKIN_LAST_REWARD_KEY = 'pt_pumpkin_last_reward_v1',
       PUMPKIN_RETIRED_KEY     = 'pt_pumpkin_retired_v1',
+      PUMPKIN_ATTEMPT_KEY     = 'pt_pumpkin_attempts_v1',
       COLLAPSE_KEY            = 'pt_dashboard_collapsed_v53',
       TASK_LOCK_KEY           = 'pt_task_lock_v55',
       DEBUG_NETLOG_KEY        = 'pt_debug_netlog',
       DEBUG_KEEP_TAB_KEY      = 'pt_debug_keep_tab',
       PROBE_MODE_KEY          = 'pt_probe_mode',
       AUTO_TAB_SESSION_KEY    = 'pt_auto_tab',
-      FILTER_ONLY_AVAIL_KEY   = 'pt_filter_only_avail';
+      FILTER_ONLY_AVAIL_KEY   = 'pt_filter_only_avail',
+      POLISH_LAST_REWARD_KEY  = 'pt_polishtorrent_last_reward';
 
 const lastOpenDateKey = (host = HOST) => 'pt_last_open_date_v1_' + host;
 
@@ -253,7 +274,8 @@ const STATUS_LABELS = {
 };
 const TERMINAL_STATUSES = ['claimed', 'already', 'failed', 'skip', 'auth', 'timeout', 'empty', 'available', 'notopen', 'maintenance'];
 const SETTLED_STATUSES = TERMINAL_STATUSES.filter(s => s !== 'available');
-const FAIL_STATUSES = ['failed', 'inactive'];
+// timeout 也算失败：连不上的站点每轮白占 20s 预算，连续 3 次后自动降级（恢复后会被 promote 回来）
+const FAIL_STATUSES = ['failed', 'inactive', 'timeout'];
 const isTerminal = st => TERMINAL_STATUSES.includes(st.status);
 const isSettled  = st => SETTLED_STATUSES.includes(st.status);
 
@@ -262,6 +284,30 @@ const isNavigating = r => !!r && r.status === STATUS.NAVIGATING;
 const loginGate = () => (isOnLoginPageNow() ? authResult() : null);
 const guardLogin = fn => async (...a) => loginGate() || fn(...a);
 
+// DirtyBytes 每日登录奖励：探针与领取共用一份解析。
+// 注意 pt-core 的 gmFetch 响应只有 text()，没有 json()，必须自己 JSON.parse。
+const DIRTYBYTES_STATUS = async () => {
+    try {
+        const res = await robustFetch(`${DIRTYBYTES_ORIGIN}${DIRTYBYTES_API}`, { timeout: 6000 });
+        if (looksLikeLoginResponse(res) || res.status === 401 || res.status === 403) {
+            return { status: 'auth', message: '会话已过期，需要重新登录' };
+        }
+        if (res.status >= 500) return { status: 'maintenance', message: `服务器错误 (HTTP ${res.status})` };
+        if (!res.ok) return { status: 'failed', message: `API HTTP ${res.status}` };
+        let data;
+        try { data = JSON.parse(await res.text()); } catch (e) { return { status: 'failed', message: 'API 返回非 JSON' }; }
+        const bonus = data?.user?.dailyLoginBonusStatus;
+        if (!bonus) return { status: 'skip', message: '未找到每日登录奖励数据' };
+        const { streak = 0, cycleDay = 0, daysInCycle = 7, nextPoints = 0, progressPercent = 0 } = bonus;
+        if (bonus.claimedToday) {
+            const t = parseDirtyBytesLastClaim(bonus.lastClaim);
+            const last = t ? fmtClock(t.getTime()) : '今日';
+            return { status: 'already', message: `连续 ${streak} 天 · 周期 ${cycleDay}/${daysInCycle} · 进度 ${progressPercent}% · 下次 +${nextPoints}p · 上次 ${last}` };
+        }
+        return { status: 'available', message: `待登录发放 · 连续 ${streak} 天 · 下次 +${nextPoints}p` };
+    } catch (e) { return { status: 'failed', message: `异常：${e.message || e}` }; }
+};
+
 const MULTI_TASK_SITES = new Set(['0dayfiles.net', 'polishtorrent.top', 'myfunzone.org', 'yu-scene.net']);
 const TAB_ONLY_HANDLERS = new Set(['czteam', 'seedcore', 'retrotoon', '0dayfiles', 'digitalcore', 'myfunzone', 'polishtorrent', 'filelist']);
 const AUTO_SCAN_CFG = { failureThreshold: 3, intervalBetween: 2500, maxPerRun: 100 };
@@ -269,19 +315,28 @@ const AUTO_SCAN_CFG = { failureThreshold: 3, intervalBetween: 2500, maxPerRun: 1
 const SEL_UNCLAIMED = '.events__prize-icon--today-unclaimed';
 const SEL_CLAIMED   = '.events__prize-icon--today-claimed';
 const SEL_FUTURE    = '.events__prize-icon--future';
-const MARK_CLAIMED  = 'events__prize-icon--today-claimed';
 const ACTIVITY_PATH_RE = /^\/(events|giveaways)\/(\d+)\/?$/;
 const ACTIVITY_LIST_RE = /^\/(events|giveaways)\/?$/;
 const ADMIN_PATH_RE    = /^\/(admin|staff|moderat|manage|acp|mcp|control-?panel)\//i;
 
 let isAutoScanRunning = false, isSequentialRunning = false;
 let listenersRegistered = false;
-const reprobeAttempted = new Set();
 const _timers = { spin: null, attendance: null, yuscene: null };
 
 const PTLog = CORE.createLogger({ tag: LOG, host: HOST });
 const log = PTLog.log, logWarn = PTLog.warn, logError = PTLog.error;
 const flushLog = PTLog.flush;
+// pt-core 的 openTab(key, url, active) 只接受 3 个参数且固定 insert:true；
+// 这里包一层，支持真正的后台静默插入，并复用 core 的 tabRegistry / closeTab。
+function openTabQ(key, url, active = false) {
+    let tab;
+    try { tab = GM_openInTab(url, { active: !!active, insert: false }); }
+    catch (e) { tab = GM_openInTab(url, { active: !!active }); }
+    if (active) window._pt_current_tab = tab;
+    tabRegistry[key] = tab;
+    return tab;
+}
+
 const _allLogHosts = () => new Set([...Object.keys(ALL_KNOWN_SITES), HOST]);
 const exportLogs = () => PTLog.exportAll(_allLogHosts());
 const clearLogs  = () => PTLog.clearAll(_allLogHosts());
@@ -289,25 +344,23 @@ const clearLogs  = () => PTLog.clearAll(_allLogHosts());
 // ==========================================
 // 优化：带伪装的、支持指数退避重试的网络请求
 // ==========================================
-async function robustFetch(url, opts = {}) {
-    const maxRetries = 3;
-    let attempt = 0;
-    while (attempt < maxRetries) {
+async function robustFetch(url, opts = {}, timeout = 0, retries = 3) {
+    // 兼容旧调用 robustFetch(url, opts, timeout, retries)：原先这两个位置参数被静默丢弃
+    const maxRetries = Math.max(1, retries | 0);
+    const base = timeout ? { ...opts, timeout } : opts;
+    for (let attempt = 1; ; attempt++) {
         try {
-            const headers = { ...DEFAULT_HEADERS, ...(opts.headers || {}) };
+            const headers = { ...DEFAULT_HEADERS, ...(base.headers || {}) };
             if (!headers['User-Agent']) headers['User-Agent'] = navigator.userAgent;
-
-            const res = await gmFetch(url, { ...opts, headers });
-
-            // 针对 429 和 503 触发重试
-            if (res.status === 429 || res.status === 503) {
+            const res = await gmFetch(url, { ...base, headers });
+            // 429/503 视为限速：还有重试机会就退避重试，最后一次把响应交给调用方判定
+            if ((res.status === 429 || res.status === 503) && attempt < maxRetries) {
                 throw new Error(`RateLimited_${res.status}`);
             }
             return res;
         } catch (e) {
-            attempt++;
             if (attempt >= maxRetries) throw e;
-            const delay = Math.pow(2, attempt) * 1000 + Math.random() * 500;
+            const delay = 2 ** attempt * 1000 + Math.random() * 500;
             log(`[Fetch] ${url} 请求异常或限速，${delay.toFixed(0)}ms 后重试 (${attempt}/${maxRetries})...`);
             await sleep(delay);
         }
@@ -350,11 +403,46 @@ const TODAY = getSiteToday(HOST);
 
 const attendanceDone = () => (Date.now() - GM_getValue(ATTENDANCE_LAST_CONFIRMED_KEY, 0)) < ATTENDANCE_COOLDOWN;
 const markAttendanceConfirmed = () => GM_setValue(ATTENDANCE_LAST_CONFIRMED_KEY, Date.now());
+// 南瓜元素常驻但点不出奖励时，只靠 20h 冷却兜不住：加"当日尝试上限 + 间隔"，避免每开一个页面就重开一次南瓜 tab
+const PUMPKIN_MAX_ATTEMPTS = 3, PUMPKIN_RETRY_GAP = 30 * MIN;
+const pumpkinAttempts = () => {
+    const a = GM_getValue(PUMPKIN_ATTEMPT_KEY, null);
+    if (!a || typeof a !== 'object') return { date: '', n: 0, ts: 0 };
+    return { date: a.date || '', n: Number(a.n) || 0, ts: Number(a.ts) || 0 };
+};
+const pumpkinAttemptsToday = () => {
+    const a = pumpkinAttempts();
+    return a.date === getSiteToday('yu-scene.net') ? a.n : 0;
+};
+function bumpPumpkinAttempt() {
+    const a = pumpkinAttempts(), today = getSiteToday('yu-scene.net');
+    const n = (a.date === today ? a.n : 0) + 1;
+    GM_setValue(PUMPKIN_ATTEMPT_KEY, { date: today, n, ts: Date.now() });
+    return n;
+}
 const pumpkinDone = () => {
     if (GM_getValue(PUMPKIN_RETIRED_KEY, false) === true) return true;
+    if (pumpkinAttemptsToday() >= PUMPKIN_MAX_ATTEMPTS) return true;
     const last = GM_getValue(PUMPKIN_LAST_CLAIM_KEY, 0);
     return !!last && Date.now() - last < PUMPKIN_COOLDOWN;
 };
+/** 还能不能再试一次：未完成、今日未超限、距上次尝试已过间隔 */
+const pumpkinRetryable = () => {
+    if (pumpkinDone()) return false;
+    const a = pumpkinAttempts();
+    return !a.ts || Date.now() - a.ts >= PUMPKIN_RETRY_GAP;
+};
+/** 站点给的"下次可领"时间戳做合理性钳制：必须晚于现在，且不超过 maxHours（防秒/毫秒/时区误判把冷却放大成几天） */
+function saneNextTs(ts, maxHours = 26) {
+    const now = Date.now();
+    if (!ts || !isFinite(ts) || ts <= now + 30 * 1000) return 0;
+    const cap = now + maxHours * HOUR;
+    if (ts > cap) {
+        log(`[Next] 站点给的冷却时间异常（${new Date(ts).toISOString()}，约 ${remainMin(ts)} 分钟后），按 ${maxHours}h 兜底`);
+        return cap;
+    }
+    return ts;
+}
 
 function setPendingEvents(host, paths) { GM_setValue(PENDING_EVENTS_PREFIX + host, { paths: [...paths], ts: Date.now() }); }
 function getPendingEvents(host) {
@@ -417,7 +505,12 @@ function setSiteStatus(host, status, suffix) {
         finalStatus = { ...status, sub };
     }
 
-    GM_setValue(keyFor(host, suffix), { status: finalStatus.status, message: finalStatus.message || '', ts: Date.now(), url: location.href, sub: finalStatus.sub });
+    const skey = keyFor(host, suffix);
+    const prev = GM_getValue(skey, null);
+    GM_setValue(skey, { status: finalStatus.status, message: finalStatus.message || '', ts: Date.now(), url: location.href, sub: finalStatus.sub });
+    if (!prev || prev.status !== finalStatus.status || (prev.message || '') !== (finalStatus.message || '')) {
+        log(`[Status] ${host}${suffix ? '/' + suffix : ''} → ${finalStatus.status}${finalStatus.message ? '：' + finalStatus.message : ''}`);
+    }
 
     if (suffix) return;
     if (['claimed', 'already', 'available', 'notopen', 'maintenance'].includes(status.status)) {
@@ -472,20 +565,44 @@ function promoteSite(host) {
 }
 const demoteSite = host => setPromoted(getPromoted().filter(h => h !== host));
 
-function getActiveSites() {
-    const demoted = getAutoDemoted();
-    const r = { ...SITES };
-    for (const h of demoted) delete r[h];
-    for (const h of getPromoted()) if (KNOWN_INACTIVE[h]) r[h] = KNOWN_INACTIVE[h];
-    return r;
+/** 维护暂停且尚未到期的站点 */
+const getPausedSites = () => Object.keys(SITE_PAUSED).filter(h => (SITE_PAUSED[h].until || 0) > Date.now());
+/** 旧域名下线后清掉它的状态/失败计数/降级记录，避免面板里留幽灵条目（只跑一次） */
+function migrateRenamedSites() {
+    const flag = 'pt_migrate_v1105';
+    if (GM_getValue(flag, false) === true) return;
+    for (const oldH of Object.keys(SITE_OVERRIDES)) {
+        if (SITE_OVERRIDES[oldH] !== null) continue;
+        GM_deleteValue(keyFor(oldH));
+        GM_deleteValue(FAILURE_KEY_PREFIX + oldH);
+        GM_deleteValue(EVENT_PATH_CACHE_PREFIX + oldH);
+        clearPendingEvents(oldH);
+        removeFromDemoted(oldH);
+        log(`[Migrate] 旧域名 ${oldH} 的本地记录已清理`);
+    }
+    GM_setValue(flag, true);
 }
-function getInactiveOnly() {
-    const promoted = getPromoted();
-    const r = {};
-    for (const h of Object.keys(KNOWN_INACTIVE)) if (!promoted.includes(h)) r[h] = KNOWN_INACTIVE[h];
-    for (const h of getAutoDemoted()) r[h] = { reason: getDemoteReason(h), autoDemoted: true };
-    return r;
+
+function siteSets() {
+    const promoted = getPromoted(), demoted = getAutoDemoted(), paused = getPausedSites();
+    const active = { ...SITES };
+    for (const h of demoted) delete active[h];
+    for (const h of paused) delete active[h];
+    for (const h of promoted) if (KNOWN_INACTIVE[h]) active[h] = KNOWN_INACTIVE[h];
+    const inactive = {};
+    for (const h of Object.keys(KNOWN_INACTIVE)) if (!promoted.includes(h)) inactive[h] = KNOWN_INACTIVE[h];
+    for (const h of demoted) inactive[h] = { reason: getDemoteReason(h), autoDemoted: true };
+    for (const h of paused) inactive[h] = { reason: SITE_PAUSED[h].reason, paused: true };
+    const scan = new Set([
+        ...Object.keys(SITES).filter(h => !demoted.includes(h) && !paused.includes(h)),
+        ...Object.keys(KNOWN_INACTIVE).filter(h => !promoted.includes(h)),
+        ...demoted,
+    ]);
+    return { promoted, demoted, active, inactive, scan };
 }
+const getActiveSites = () => siteSets().active;
+const getInactiveOnly = () => siteSets().inactive;
+
 function needsRecheck(host) {
     const s = GM_getValue(keyFor(host), null);
     if (!s || !s.ts || !s.status) return true;
@@ -507,13 +624,22 @@ function getCachedEventPath(host) {
 const setCachedEventPath = (host, path, source = 'unknown') => GM_setValue(cacheKeyFor(host), { path, source, ts: Date.now() });
 const clearCachedEventPath = host => GM_deleteValue(cacheKeyFor(host));
 
+// 每个页面一个 owner 标识：只释放自己拿到的锁，避免页面刷新/多标签互相删锁
+const LOCK_OWNER = Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
 function tryAcquireTaskLock(type) {
     const existing = GM_getValue(TASK_LOCK_KEY, null);
-    if (existing && existing.ts && (Date.now() - existing.ts) < TASK_LOCK_TTL) return false;
-    GM_setValue(TASK_LOCK_KEY, { type, ts: Date.now() });
+    if (existing && existing.ts && (Date.now() - existing.ts) < TASK_LOCK_TTL) {
+        log(`[TaskLock] 已有任务运行中（${existing.type || '?'}，${Math.round((Date.now() - existing.ts) / 1000)}s 前），跳过本次 ${type}`);
+        return false;
+    }
+    GM_setValue(TASK_LOCK_KEY, { type, ts: Date.now(), owner: LOCK_OWNER });
     return true;
 }
-const releaseTaskLock = () => GM_deleteValue(TASK_LOCK_KEY);
+function releaseTaskLock() {
+    const cur = GM_getValue(TASK_LOCK_KEY, null);
+    if (cur && cur.owner && cur.owner !== LOCK_OWNER) return; // 不是自己的锁，别删
+    GM_deleteValue(TASK_LOCK_KEY);
+}
 function isTaskLocked() {
     const existing = GM_getValue(TASK_LOCK_KEY, null);
     if (!existing || !existing.ts) return false;
@@ -592,15 +718,30 @@ const MONTH_ABBR = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct',
 const MONTH_CN = ['一月','二月','三月','四月','五月','六月','七月','八月','九月','十月','十一月','十二月'];
 const MONTH_INDEX = { jan:0, feb:1, mar:2, apr:3, may:4, jun:5, jul:6, aug:7, sep:8, oct:9, nov:10, dec:11 };
 
+/**
+ * 站点"今天"的候选日期。
+ * 58 个站点里只有 32 个配了时区，其余回退 UTC+8；对欧美站点，在 UTC+8 的凌晨
+ * 会比站点本地日期早一天，导致"今日活动"被判成已过期。这里对没配时区的站点
+ * 同时接受 UTC+8 与 UTC 两个日期（两者最多差一天）。
+ */
+function siteTodayCandidates(host = HOST) {
+    const t = getSiteToday(host);
+    if (SITE_TIMEZONE[host]) return [t];
+    const utc = new Date().toISOString().slice(0, 10);
+    return utc === t ? [t] : [t, utc];
+}
+
 function findTodayArticle(root = document, host = HOST) {
-    const [, m, d] = getSiteToday(host).split('-').map(Number);
-    const enLabel = `${MONTH_ABBR[m - 1]} ${d}`;
-    const cnLabel = `${d} ${MONTH_CN[m - 1]}`;
+    const labels = new Set();
+    for (const date of siteTodayCandidates(host)) {
+        const [, m, d] = date.split('-').map(Number);
+        labels.add(`${MONTH_ABBR[m - 1]} ${d}`);
+        labels.add(`${d} ${MONTH_CN[m - 1]}`);
+    }
     for (const art of root.querySelectorAll('article.events__prize')) {
         const h = art.querySelector('.events__prize-heading');
         if (!h) continue;
-        const text = h.textContent.trim();
-        if (text === enLabel || text === cnLabel) return art;
+        if (labels.has(h.textContent.trim())) return art;
     }
     const unclaimed = root.querySelector(SEL_UNCLAIMED);
     if (unclaimed) return unclaimed.closest('article') || unclaimed.closest('.panelV2') || unclaimed.closest('form')?.parentElement || unclaimed.parentElement;
@@ -712,20 +853,24 @@ function buildSeedcoreBubbleMessage() {
 }
 
 function checkEventList(doc, host) {
-    const today = getSiteToday(host);
-    const [, m, d] = today.split('-').map(Number);
-    const monthStr = MONTH_ABBR[m - 1]; // 例如 "Nov"
-
-    // 构建正则：匹配 "Nov 14", "14 Nov", 甚至 "Nov 14th"
-    const todayRegex = new RegExp(`\\b${monthStr}\\s*${d}(?:st|nd|rd|th)?\\b`, 'i');
-    const todayRegex2 = new RegExp(`\\b${d}(?:st|nd|rd|th)?\\s*${monthStr}\\b`, 'i');
-    const anyDateRegex = new RegExp(`\\b(${MONTH_ABBR.join('|')})\\s*\\d+`, 'i');
+    const anyDateRe = new RegExp(`\\b(${MONTH_ABBR.join('|')})\\s*\\d+`, 'i');
+    // 每个候选日期一套 "Nov 14" / "14 Nov" / "Nov 14th" 正则
+    const mats = siteTodayCandidates(host).map(date => {
+        const [, m, d] = date.split('-').map(Number);
+        const mon = MONTH_ABBR[m - 1];
+        return {
+            date,
+            re: [new RegExp(`\\b${mon}\\s*${d}(?:st|nd|rd|th)?\\b`, 'i'),
+                 new RegExp(`\\b${d}(?:st|nd|rd|th)?\\s*${mon}\\b`, 'i')],
+        };
+    });
+    const isToday = text => mats.some(x => x.re[0].test(text) || x.re[1].test(text));
+    const inRange = (start, end) => mats.some(x => x.date >= start && x.date <= end);
+    const isFuture = start => mats.every(x => start > x.date);
 
     let hasAnyEvent = false, hasFuture = false;
-    const todayPaths = [];
-    const allPaths = new Set();
+    const todayPaths = [], allPaths = new Set();
 
-    // 1. 标准方式：尝试从 <a> 标签中解析活动链接
     for (const a of doc.querySelectorAll('a[href*="/events/"], a[href*="/giveaways/"]')) {
         const rawHref = a.getAttribute('href');
         if (!rawHref) continue;
@@ -733,60 +878,46 @@ function checkEventList(doc, host) {
         try { p = new URL(rawHref, location.origin).pathname; } catch (e) {}
         const match = p.match(ACTIVITY_PATH_RE);
         if (!match) continue;
-
         const path = `/${match[1]}/${match[2]}`;
         allPaths.add(path);
 
         const container = a.closest('tr') || a.closest('li') || a.closest('div') || a.parentElement;
         if (!container) continue;
+        const text = container.textContent || '';
+        const times = [...container.querySelectorAll('time[datetime]')].map(t => t.getAttribute('datetime') || '');
 
-        const timeEls = container.querySelectorAll('time[datetime]');
-        const rawText = container.textContent || '';
-
-        if (timeEls.length >= 2) {
+        if (times.length) {
             hasAnyEvent = true;
-            const startDate = (timeEls[0].getAttribute('datetime') || '').slice(0, 10);
-            const endDate = (timeEls[1].getAttribute('datetime') || '').slice(0, 10);
-            if (startDate && endDate && today >= startDate && today <= endDate) todayPaths.push(path);
-            else if (startDate && startDate > today) hasFuture = true;
-        } else if (timeEls.length === 1) {
+            const start = times[0].slice(0, 10);
+            const end = (times[1] || '').slice(0, 10);
+            if (end) {
+                if (start && inRange(start, end)) todayPaths.push(path);
+                else if (start && isFuture(start)) hasFuture = true;
+            } else if (mats.some(x => start.startsWith(x.date))) todayPaths.push(path);
+            else if (isFuture(start)) hasFuture = true;
+        } else if (isToday(text)) {
             hasAnyEvent = true;
-            const dt = timeEls[0].getAttribute('datetime') || '';
-            if (dt && dt.startsWith(today)) todayPaths.push(path);
-            else if (dt && dt.slice(0, 10) > today) hasFuture = true;
-        } else {
-            // 👇 新增：无 <time> 标签时，依靠纯文本日期匹配
-            if (todayRegex.test(rawText) || todayRegex2.test(rawText)) {
-                hasAnyEvent = true;
-                todayPaths.push(path);
-            } else if (anyDateRegex.test(rawText)) {
-                hasAnyEvent = true;
-            }
+            todayPaths.push(path);
+        } else if (anyDateRe.test(text)) {
+            hasAnyEvent = true;
         }
     }
 
-    // 2. 终极兜底：如果页面连 <a> 标签都没有（比如 nordicq.org 纯卡片渲染）
-    if (allPaths.size === 0) {
-        // 如果当前本身就在详情页，并且有可领元素
+    // 兜底：页面完全没有活动链接（纯卡片渲染）
+    if (!allPaths.size) {
         if (ACTIVITY_PATH_RE.test(location.pathname)) {
             if (doc.querySelector(SEL_UNCLAIMED)) return { paths: [location.pathname], source: 'local-hint' };
-        } else {
-            // 如果在列表页，完全没有链接，看看页面文本里有没有今天的日期
-            const bodyText = doc.body?.innerText || '';
-            if (todayRegex.test(bodyText) || todayRegex2.test(bodyText)) {
-                // 如果页面提到了今天，强行返回 /events 让后续去详情页尝试
-                return { paths: ['/events'], source: 'remote-hint' };
-            }
+        } else if (isToday(doc.body?.innerText || '')) {
+            return { paths: ['/events'], source: 'remote-hint' };
         }
     }
 
-    if (!hasAnyEvent && allPaths.size === 0) return { status: 'inactive', message: '活动列表为空' };
     if (hasAnyEvent) {
-        if (todayPaths.length > 0) return { paths: todayPaths, source: 'remote-hint' };
+        if (todayPaths.length) return { paths: todayPaths, source: 'remote-hint' };
         if (hasFuture) return { status: 'notopen', message: '今日无活动，有未来预告' };
         return { status: 'inactive', message: '活动已全部过期' };
     }
-    if (allPaths.size > 0) return { paths: [...allPaths], source: 'remote-hint' };
+    if (allPaths.size) return { paths: [...allPaths], source: 'remote-hint' };
     return { status: 'inactive', message: '活动列表为空' };
 }
 
@@ -828,18 +959,19 @@ function detectActivityHints(root, base = location.origin) {
         let absHref = '';
         try { absHref = new URL(href, base).href; } catch (e) { continue; }
         if (!absHref.startsWith(baseOrigin)) continue;
-        if (ACTIVITY_NEGATIVE_RE.test(href) || ACTIVITY_NEGATIVE_RE.test(a.className || '')) continue;
+        const cls = a.getAttribute('class') || '';
+        if (ACTIVITY_NEGATIVE_RE.test(href) || ACTIVITY_NEGATIVE_RE.test(cls)) continue;
         const inNav = !!a.closest('header, nav, .top-nav, .sidebar, aside, .menu, .navbar, .secondary-nav, .breadcrumbsV2, .navigation');
         const hrefMatch = ACTIVITY_HREF_RE.test(href);
         if (!inNav && !hrefMatch) continue;
         const reasons = [];
         if (a.querySelector('svg animate, svg animateTransform')) reasons.push('svg-animate');
-        if (ACTIVITY_ANIM_RE.test(a.className || '')) reasons.push('self-anim');
+        if (ACTIVITY_ANIM_RE.test(cls)) reasons.push('self-anim');
         for (const child of a.querySelectorAll('*')) {
-            if (ACTIVITY_ANIM_RE.test(child.className || '')) { reasons.push('child-anim'); break; }
+            if (ACTIVITY_ANIM_RE.test(child.getAttribute('class') || '')) { reasons.push('child-anim'); break; }
         }
         if (a.querySelector('.badge, .dot, .indicator, .unread, [class*="badge"], [class*="dot"]')) reasons.push('badge');
-        if (a.querySelector('i, svg, img') && (ACTIVITY_ICON_RE.test(a.innerHTML) || ACTIVITY_ICON_RE.test(a.className || ''))) reasons.push('icon');
+        if (a.querySelector('i, svg, img') && (ACTIVITY_ICON_RE.test(a.innerHTML) || ACTIVITY_ICON_RE.test(cls))) reasons.push('icon');
         const textLower = (a.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
         if (ACTIVITY_TEXT_HINTS.some(t => textLower.includes(t.toLowerCase()))) reasons.push('text');
         if (hrefMatch && inNav) reasons.push('href');
@@ -924,9 +1056,9 @@ async function submitClaimPost(action, token, referer, refreshToken) {
             log(`[Claim] 使用新 Token 重试结果: ${res ? res.status : 'no-response'}`);
         }
     }
-    if (!res) return { ok: false, status: 0 };
+    if (!res) { log(`[Claim] POST ${postUrl} 无响应`); return { ok: false, status: 0 }; }
     if (res.status === 429) return { ok: false, status: 429, rateLimited: true };
-    if (!res.ok) return { ok: false, status: res.status };
+    if (!res.ok) { log(`[Claim] POST ${postUrl} → HTTP ${res.status}`); return { ok: false, status: res.status }; }
 
     const html = await res.text();
     const doc = new DOMParser().parseFromString(html, 'text/html');
@@ -938,6 +1070,7 @@ async function submitClaimPost(action, token, referer, refreshToken) {
 
     const todayArt = findTodayArticle(doc, HOST);
     const isTodayClaimed = todayArt && todayArt.querySelector('.events__prize-icon--today-claimed');
+    if (!isTodayClaimed) log(`[Claim] POST ${postUrl} 返回 ${res.status}，但页面没有"已领"标记（回退整页提交）`);
 
     return isTodayClaimed ? { ok: true, html } : { ok: false, status: res.status };
 }
@@ -966,7 +1099,7 @@ async function directClaimFromArticle(base, host, targetPath, article) {
 async function probeEventPaths(host, base, allPaths) {
     const paths = allPaths.slice(0, 5);
     const availablePaths = [], alreadyMsgs = [], directRewards = [];
-    let hasAlready = false, hasNotopen = false, directClaimedCount = 0;
+    let hasAlready = false, hasNotopen = false, directClaimedCount = 0, rateLimited = false;
     const details = await Promise.allSettled(paths.map(p =>
         loadEventPage((u, o) => robustFetch(u, o), `${base}${p}`, host, { timeout: 6000 })
         .then(r => {
@@ -978,7 +1111,7 @@ async function probeEventPaths(host, base, allPaths) {
     for (const r of details) {
         if (r.status !== 'fulfilled' || !r.value) continue;
         const v = r.value;
-        if (v.rateLimited) { log(`[Probe] ${host} 429 限速，跳过本站剩余活动`); break; }
+        if (v.rateLimited) { rateLimited = true; log(`[Probe] ${host} 429 限速，跳过本站剩余活动`); break; }
         if (v.unknown) { availablePaths.push(v.targetPath); continue; }
         const { targetPath, article, state } = v;
         if (state === 'unclaimed') {
@@ -1013,6 +1146,7 @@ async function probeEventPaths(host, base, allPaths) {
             message: parts.join('，') || (directClaimedCount > 0 ? '后台极速领取成功' : '今日已领'),
         };
     }
+    if (rateLimited) return { status: 'timeout', message: '探测被限速 (429)，稍后重试' };
     if (hasNotopen) return { status: 'notopen', message: '今日未开放' };
     return { status: 'inactive', message: '无活动可领取' };
 }
@@ -1028,250 +1162,217 @@ function probeErrorToStatus(e) {
     return { status: 'failed', message: `探测异常：${msg}` };
 }
 
-async function probeSpecialSiteHealth(host) {
-    try {
-        const res = await robustFetch(`https://${host}/prize-wheel`, { timeout: 8000 });
-        if (res.status >= 500) return { status: 'maintenance', message: `服务器错误 (HTTP ${res.status})` };
-        const html = await res.text();
-        if (isMaintenancePage(html)) return { status: 'maintenance', message: '站点维护中' };
-        if (host === 'yu-scene.net' && /503\s*[-:]?\s*SERVICE UNAVAILABLE|offline for scheduled maintenance/i.test(html) && !/pw__status/.test(html)) {
-            return { status: 'maintenance', message: '站点维护中 (503)' };
-        }
-    } catch (e) {
-        const msg = String((e && e.message) || e);
-        if (isNetError(msg) || (e && e.name === 'AbortError')) {
-            return { status: 'maintenance', message: `网络层异常：${msg.slice(0, 60)}` };
-        }
-        return { status: 'failed', message: `探测异常：${msg}` };
+// ==========================================
+// 站点探针：不依赖当前页面 DOM，可在任意站点标签页里远程探测
+// ==========================================
+/** 统一校验响应：重定向登录 / 4xx-5xx / 维护页 → {status}；正常 → {html} */
+async function readPage(res, path) {
+    if (res.redirected && /\/(login|auth|signin)/i.test(new URL(res.finalUrl || res.url).pathname)) {
+        return { status: { status: 'auth', message: '会话已过期' } };
     }
-    return null;
+    const httpBad = httpStatusToResult(res, { auth: true });
+    if (httpBad) return { status: httpBad };
+    if (!res.ok) return { status: { status: 'failed', message: `GET ${path} → HTTP ${res.status}` } };
+    const html = await res.text();
+    const bad = classifyHtml(html);
+    if (bad) return { status: bad };
+    return { html };
 }
 
-// 优化：将站点探测逻辑插件化
-const SITE_PROBES = {
+/** 列表页 → {result}（有今日活动）/ {list,doc}（无活动，doc 供上层继续找线索）/ {error} */
+async function probeEventsList(base, host, path) {
+    let res;
+    try { res = await robustFetch(`${base}${path}`, host === 'jme-reunit3d.de' ? { timeout: 40000 } : {}); }
+    catch (e) { return { error: probeErrorToStatus(e) }; }
+    const page = await readPage(res, path);
+    if (page.status) return { error: page.status };
+    const doc = new DOMParser().parseFromString(page.html, 'text/html');
+    const list = checkEventList(doc, host);
+    if (list.paths && list.paths.length) return { result: await probeEventPaths(host, base, list.paths) };
+    return { list, doc };
+}
 
-    'v3x.club': async () => {
-        try {
-            let isClaimed = false;
-            let messages = [];
-
-            // 第一步：签到 API
-            const dailyRes = await robustFetch('https://api.v3x.club/me/daily/claim-login', {
-                method: 'POST',
-                credentials: 'include',
-                headers: { 'Accept': '*/*', 'Origin': 'https://v3x.club', 'Referer': 'https://v3x.club/' }
-            });
-
-            if (dailyRes.status === 401 || dailyRes.status === 403) return { status: 'auth', message: '需要登录' };
-
-            if (dailyRes.status === 200 || dailyRes.status === 204) {
-                let dailyRewardStr = '';
-                try {
-                    const text = await dailyRes.text();
-                    if (text && text.trim()) {
-                        const json = JSON.parse(text);
-                        // 兼容多种可能的 JSON 字段名
-                        const reward = json.reward || json.points || json.amount || json.value;
-                        if (reward !== undefined && reward !== null) {
-                            dailyRewardStr = `签到：+${reward}`;
-                        }
-                    }
-                } catch (e) {}
-
-                messages.push(dailyRewardStr || '签到：成功');
-                isClaimed = true;
-            } else if (dailyRes.status === 400 || dailyRes.status === 409) {
-                messages.push('签到：今日已领');
-            } else {
-                messages.push(`签到异常(${dailyRes.status})`);
-            }
-
-            // 第二步：转盘 API
-            const wheelRes = await robustFetch('https://api.v3x.club/me/wheel/spin', {
-                method: 'POST',
-                credentials: 'include',
-                headers: { 'Accept': '*/*', 'Origin': 'https://v3x.club', 'Referer': 'https://v3x.club/' }
-            });
-
-            if (wheelRes.status === 200) {
-                let wheelRewardStr = '';
-                try {
-                    const text = await wheelRes.text();
-                    if (text && text.trim()) {
-                        const json = JSON.parse(text);
-                        if (json.ok) {
-                            const reward = json.reward || json.points || json.amount || json.value;
-                            if (reward !== undefined && reward !== null) {
-                                wheelRewardStr = `转盘：+${reward}`;
-                            } else {
-                                wheelRewardStr = `转盘：${json.label || '成功'}`;
-                            }
-                        }
-                    }
-                } catch (e) {}
-
-                if (wheelRewardStr) {
-                    messages.push(wheelRewardStr);
-                    isClaimed = true;
-                } else {
-                    messages.push('转盘：已转');
-                }
-            } else if (wheelRes.status === 400 || wheelRes.status === 409) {
-                messages.push('转盘：今日已转');
-            } else {
-                messages.push(`转盘异常(${wheelRes.status})`);
-            }
-
-            const finalMsg = messages.join('，');
-            // 只要签到或转盘有任何一个成功，状态就是 claimed
-            return { status: isClaimed ? 'claimed' : 'already', message: finalMsg };
-
-        } catch (e) {
-            return { status: 'failed', message: `异常：${e.message}` };
-        }
-    },
-
-    'dirtybytes.net': async () => {
-        try {
-            const res = await robustFetch(`${DIRTYBYTES_ORIGIN}${DIRTYBYTES_API}`, { timeout: 6000 });
-            if (res.status === 401 || res.status === 403 || (res.redirected && /login/i.test(res.finalUrl))) return { status: 'auth', message: '会话已过期' };
-            if (res.status >= 500) return { status: 'maintenance', message: `服务器错误 (HTTP ${res.status})` };
-            if (!res.ok) return { status: 'failed', message: `API HTTP ${res.status}` };
-            const data = JSON.parse(await res.text());
-            const bonus = data?.user?.dailyLoginBonusStatus;
-            if (!bonus) return { status: 'skip', message: '未找到每日登录奖励数据' };
-            const { streak = 0, cycleDay = 0, daysInCycle = 7, nextPoints = 0, progressPercent = 0 } = bonus;
-            if (bonus.claimedToday) {
-                const t = parseDirtyBytesLastClaim(bonus.lastClaim);
-                const lastClaimStr = t ? fmtClock(t.getTime()) : '今日';
-                return { status: 'already', message: `连续 ${streak} 天 · 周期 ${cycleDay}/${daysInCycle} · 进度 ${progressPercent}% · 下次 +${nextPoints}p · 上次 ${lastClaimStr}` };
-            }
-            return { status: 'available', message: `待登录发放 · 连续 ${streak} 天 · 下次 +${nextPoints}p` };
-        } catch (e) { return { status: 'failed', message: `异常：${e.message || e}` }; }
-    },
-    'filelist.io': async () => {
-        try {
-            const res = await robustFetch('https://filelist.io/spin.php', { timeout: 6000 });
-            if (res.ok) {
-                const html = await res.text();
-                const doc = new DOMParser().parseFromString(html, 'text/html');
-                const bodyText = doc.body?.innerText || '';
-
-                if (/This event has ended|Please check again later/i.test(bodyText)) {
-                    return { status: 'inactive', message: '转盘活动已结束' };
-                }
-
-                const cooldownMatch = bodyText.match(/Please check back again in\s*(?:(\d+)h\s*)?(?:(\d+)m\s*)?(?:(\d+)s)?/i);
-                if (cooldownMatch) {
-                    const h = parseInt(cooldownMatch[1] || '0', 10);
-                    const m = parseInt(cooldownMatch[2] || '0', 10);
-                    const s = parseInt(cooldownMatch[3] || '0', 10);
-                    const nextTs = Date.now() + (h * 3600 + m * 60 + s) * 1000;
-                    GM_setValue(FILELIST_SPIN_NEXT_KEY, nextTs);
-                    return { status: 'already', message: cooldownText(GM_getValue(FILELIST_LAST_REWARD_KEY, '未知'), nextTs, false) };
-                }
-                if (doc.querySelector('#spin')) return { status: 'available', message: '转盘可领取' };
-                return { status: 'skip', message: '未找到 Spin 按钮' };
-            }
-        } catch (e) {}
-    },
-    'myfunzone.org': async () => {
-        try {
-            const res = await robustFetch('https://myfunzone.org/events', { timeout: 6000 });
-            if (res.ok) {
-                const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
-                const list = checkEventList(doc, HOST);
-                if (list.paths && list.paths.length) {
-                    return await probeEventPaths(HOST, 'https://myfunzone.org', list.paths);
-                }
-            }
-        } catch (e) {}
-        try {
-            const res = await robustFetch('https://myfunzone.org/', { timeout: 6000 });
-            if (res.ok) {
-                const html = await res.text();
-                const doc = new DOMParser().parseFromString(html, 'text/html');
-                const fab = doc.getElementById('dw-fab');
-                const spinBtn = doc.getElementById('dw-spin');
-                const isFabAvailable = fab && fab.querySelector('b') && parseInt(fab.querySelector('b').textContent) > 0;
-                const isBtnAvailable = spinBtn && !spinBtn.disabled && spinBtn.textContent.includes('SPIN THE WHEEL');
-                if (isFabAvailable || isBtnAvailable) return { status: 'available', message: '转盘可领取' };
-                if ((spinBtn && spinBtn.textContent.includes('SEE YOU TOMORROW')) || !fab) return { status: 'already', message: '今日已领' };
-                return { status: 'skip', message: '未找到转盘' };
-            }
-        } catch (e) {}
-    },
-    'polishtorrent.top': async () => {
-        try {
-            const res = await robustFetch('https://polishtorrent.top/events', { timeout: 6000 });
-            if (res.ok) {
-                const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
-                const list = checkEventList(doc, HOST);
-                if (list.paths && list.paths.length) {
-                    return await probeEventPaths(HOST, 'https://polishtorrent.top', list.paths);
-                }
-            }
-        } catch (e) {}
-        try {
-            const res = await robustFetch('https://polishtorrent.top/spin', { timeout: 6000 });
-            if (res.ok) {
-                const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
-                const btn = doc.querySelector('#spinBtn');
-                if (!btn) return { status: 'inactive', message: '未找到转盘按钮（页面结构可能已变化）' };
-                if (btn.hasAttribute('disabled') || btn.classList.contains('disabled')) {
-                    const last = doc.querySelector('.spin-already strong')?.textContent?.trim() || '';
-                    return { status: 'already', message: last ? `今日已领 · 上次：${last}` : '今日转盘已领取' };
-                }
-                return { status: 'available', message: '转盘可领取' };
-            }
-        } catch (e) {}
-        return { status: 'skip', message: 'events 与 /spin 均探测失败' };
-    },
-    'yu-scene.net': async () => {
-        try {
-            const res = await robustFetch('https://yu-scene.net/events', { timeout: 6000 });
-            if (res.ok) {
-                const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
-                const list = checkEventList(doc, HOST);
-                if (list.paths && list.paths.length) {
-                    return await probeEventPaths(HOST, 'https://yu-scene.net', list.paths);
-                }
-            }
-        } catch (e) {}
-        // 走 needsTab 分支（其中会做 /prize-wheel 健康检查）
-    },
-    'czteam.me': async () => {
-        try {
-            const res = await robustFetch('https://czteam.me/events.php', { timeout: 6000 });
-            if (res.ok) {
-                const html = await res.text();
-                const doc = new DOMParser().parseFromString(html, 'text/html');
-                const h2 = doc.querySelector('.gift-hero h2');
-                if (h2 && /already opened/i.test(h2.textContent || '')) return { status: 'already', message: '今日礼物已领取' };
-                if (doc.querySelector('button.gift-btn')) return { status: 'available', message: '礼物可领取' };
-                if (doc.querySelector('.gift-locked')) return { status: 'already', message: '今日已领取' };
-                return { status: 'skip', message: '未找到每日礼物按钮' };
-            }
-        } catch (e) {}
-    },
-    'seedcore.net': async () => {
-        try {
-            const detail = await loadEventPage((u, o) => robustFetch(u, o), 'https://seedcore.net/events/2', HOST);
-            if (detail.article) {
-                if (detail.state === 'claimed') return { status: 'already', message: messagesOf(detail.article).join('，') || '今日已领' };
-                if (detail.state === 'unclaimed') return { status: 'available', message: '检测到可领取' };
-                if (detail.state === 'future') return { status: 'notopen', message: '今日未开放' };
-            } else if (detail.status) {
-                return detail.status;
-            }
-        } catch (e) {}
-    },
-    '0dayfiles.net': async () => {
-        if (!attendanceDone() || GM_getValue(SPINWHEEL_NEXT_KEY, 0) <= Date.now()) {
-            return { status: 'available', message: '有签到/转盘任务待处理' };
-        }
-        return { status: 'already', message: '签到和转盘均已完成' };
+/** 详情页探测（可选后台直领）：三个调用分支共用 */
+async function probeDetail(base, host, path, { directClaim = false, cacheSource = null } = {}) {
+    const detail = await loadEventPage((u, o) => robustFetch(u, o), `${base}${path}`, host);
+    if (detail.netError) return { status: 'failed', message: 'fetch 详情页超时', eventPath: path };
+    if (detail.httpError) return { status: 'failed', message: `GET ${path} → HTTP ${detail.httpStatus}`, eventPath: path };
+    if (detail.status) return { ...detail.status, eventPath: path };
+    if (!detail.article) return { status: 'inactive', message: '未找到今日格子', eventPath: path };
+    if (cacheSource) setCachedEventPath(host, path, cacheSource);
+    const text = messagesOf(detail.article).join('，');
+    if (detail.state === 'claimed') {
+        if (text) addCollectedReward(host, path, text);
+        return { status: 'already', message: text || '今日已领', eventPath: path };
     }
+    if (detail.state === 'future') return { status: 'notopen', message: '今日未开放', eventPath: path };
+    if (detail.state === 'unclaimed' && directClaim) {
+        const claimed = await directClaimFromArticle(base, host, path, detail.article);
+        if (claimed === 'rate-limited') return { status: 'available', message: '限速，需开 tab', eventPath: path };
+        if (claimed) {
+            if (claimed.text) addCollectedReward(host, path, claimed.text);
+            log(`[DirectClaim] ${host} ${path} 后台极速领取成功`);
+            return { status: 'claimed', message: claimed.text || '后台极速领取成功', eventPath: path };
+        }
+    }
+    if (detail.state === 'unclaimed') return { status: 'available', message: '检测到可领取', eventPath: path };
+    return { status: 'skip', message: '状态未知', eventPath: path };
+}
+
+/** 只关心"有今日活动"的探针（myfunzone / polishtorrent / yu-scene 共用） */
+async function probeEventsPage(host, base) {
+    const r = await probeEventsList(base, host, '/events');
+    return r.result || null;
+}
+
+// ---- 站点私有探针 ----
+const v3xPost = url => robustFetch(url, {
+    method: 'POST', credentials: 'include',
+    headers: { 'Accept': '*/*', 'Origin': 'https://v3x.club', 'Referer': 'https://v3x.club/' },
+});
+const v3xReward = j => (j ? (j.reward ?? j.points ?? j.amount ?? j.value) : undefined);
+
+async function v3xProbe() {
+    try {
+        const msgs = [];
+        let claimed = false;
+        const daily = await v3xPost('https://api.v3x.club/me/daily/claim-login');
+        if (daily.status === 401 || daily.status === 403) return { status: 'auth', message: '需要登录' };
+        if (daily.status === 200 || daily.status === 204) {
+            let r;
+            try { const t = (await daily.text()).trim(); if (t) r = v3xReward(JSON.parse(t)); } catch (e) {}
+            msgs.push(r !== undefined && r !== null ? `签到：+${r}` : '签到：成功');
+            claimed = true;
+        } else if (daily.status === 400 || daily.status === 409) msgs.push('签到：今日已领');
+        else msgs.push(`签到异常(${daily.status})`);
+
+        const wheel = await v3xPost('https://api.v3x.club/me/wheel/spin');
+        if (wheel.status === 200) {
+            let label = '';
+            try {
+                const t = (await wheel.text()).trim();
+                if (t) {
+                    const j = JSON.parse(t);
+                    if (j.ok) {
+                        const r = v3xReward(j);
+                        label = (r !== undefined && r !== null) ? `转盘：+${r}` : `转盘：${j.label || '成功'}`;
+                    }
+                }
+            } catch (e) {}
+            if (label) { msgs.push(label); claimed = true; } else msgs.push('转盘：已转');
+        } else if (wheel.status === 400 || wheel.status === 409) msgs.push('转盘：今日已转');
+        else msgs.push(`转盘异常(${wheel.status})`);
+        return { status: claimed ? 'claimed' : 'already', message: msgs.join('，') };
+    } catch (e) { return { status: 'failed', message: `异常：${e.message}` }; }
+}
+
+/** filelist 冷却文本 → 下次可转时间戳（探针与领取共用） */
+function filelistCooldownTs(text) {
+    const m = text.match(/Please check back again in\s*(?:(\d+)h\s*)?(?:(\d+)m\s*)?(?:(\d+)s)?/i);
+    if (!m) return 0;
+    const n = i => parseInt(m[i] || '0', 10);
+    return Date.now() + ((n(1) * 3600 + n(2) * 60 + n(3)) * 1000);
+}
+const FILELIST_ENDED_RE = /This event has ended|Please check again later/i;
+
+async function filelistProbe() {
+    try {
+        const res = await robustFetch('https://filelist.io/spin.php', { timeout: 6000 });
+        if (res.status >= 500) return { status: 'maintenance', message: `服务器错误 (HTTP ${res.status})` };
+        if (!res.ok) return { status: 'failed', message: `GET /spin.php → HTTP ${res.status}` };
+        const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
+        const bodyText = doc.body?.innerText || '';
+        if (FILELIST_ENDED_RE.test(bodyText)) return { status: 'inactive', message: '转盘活动已结束' };
+        const nextTs = filelistCooldownTs(bodyText);
+        if (nextTs) {
+            GM_setValue(FILELIST_SPIN_NEXT_KEY, saneNextTs(nextTs, 26));
+            return { status: 'already', message: cooldownText(GM_getValue(FILELIST_LAST_REWARD_KEY, '未知') || '未知', nextTs, false) };
+        }
+        if (doc.querySelector('#spin')) return { status: 'available', message: '转盘可领取' };
+        return { status: 'skip', message: '未找到 Spin 按钮' };
+    } catch (e) { return { status: 'failed', message: `异常：${e.message || e}` }; }
+}
+
+/** myfunzone 转盘状态（探针与领取共用同一套判定） */
+function myfunzoneWheelState(doc) {
+    const fab = doc.getElementById('dw-fab');
+    const spinBtn = doc.getElementById('dw-spin');
+    const fabReady = !!(fab && fab.querySelector('b') && parseInt(fab.querySelector('b').textContent) > 0);
+    const btnReady = !!(spinBtn && !spinBtn.disabled && spinBtn.textContent.includes('SPIN THE WHEEL'));
+    const done = !!(spinBtn && spinBtn.textContent.includes('SEE YOU TOMORROW')) || (!fab && !btnReady);
+    return { fab, spinBtn, fabReady, btnReady, done };
+}
+async function myfunzoneWheelProbe() {
+    try {
+        const res = await robustFetch('https://myfunzone.org/', { timeout: 6000 });
+        if (!res.ok) return { status: 'failed', message: `GET / → HTTP ${res.status}` };
+        const s = myfunzoneWheelState(new DOMParser().parseFromString(await res.text(), 'text/html'));
+        if (s.fabReady || s.btnReady) return { status: 'available', message: '转盘可领取' };
+        if (s.done) return { status: 'already', message: '今日已领' };
+        return { status: 'skip', message: '未找到转盘' };
+    } catch (e) { return { status: 'failed', message: `异常：${e.message || e}` }; }
+}
+
+/** polishtorrent 转盘状态（探针与领取共用） */
+function polishWheelState(doc) {
+    const btn = doc.querySelector('#spinBtn');
+    if (!btn) return { state: 'missing' };
+    if (btn.hasAttribute('disabled') || btn.classList.contains('disabled')) {
+        const last = doc.querySelector('.spin-already strong')?.textContent?.trim() || '';
+        return { state: 'already', last };
+    }
+    return { state: 'available' };
+}
+async function polishtorrentWheelProbe() {
+    try {
+        const res = await robustFetch('https://polishtorrent.top/spin', { timeout: 6000 });
+        if (!res.ok) return { status: 'failed', message: `GET /spin → HTTP ${res.status}` };
+        const s = polishWheelState(new DOMParser().parseFromString(await res.text(), 'text/html'));
+        if (s.state === 'missing') return { status: 'inactive', message: '未找到转盘按钮（页面结构可能已变化）' };
+        if (s.state === 'already') return { status: 'already', message: s.last ? `今日已领 · 上次：${s.last}` : '今日转盘已领取' };
+        return { status: 'available', message: '转盘可领取' };
+    } catch (e) { return { status: 'failed', message: `异常：${e.message || e}` }; }
+}
+
+async function czteamProbe() {
+    try {
+        const res = await robustFetch('https://czteam.me/events.php', { timeout: 6000 });
+        if (!res.ok) return { status: 'failed', message: `GET /events.php → HTTP ${res.status}` };
+        const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
+        const h2 = doc.querySelector('.gift-hero h2');
+        if (h2 && /already opened/i.test(h2.textContent || '')) return { status: 'already', message: '今日礼物已领取' };
+        if (doc.querySelector('button.gift-btn')) return { status: 'available', message: '礼物可领取' };
+        if (doc.querySelector('.gift-locked')) return { status: 'already', message: '今日已领取' };
+        return { status: 'skip', message: '未找到每日礼物按钮' };
+    } catch (e) { return { status: 'failed', message: `异常：${e.message || e}` }; }
+}
+
+async function seedcoreProbe() {
+    try {
+        const detail = await loadEventPage((u, o) => robustFetch(u, o), 'https://seedcore.net/events/2', 'seedcore.net');
+        if (detail.article) {
+            if (detail.state === 'claimed') return { status: 'already', message: messagesOf(detail.article).join('，') || '今日已领' };
+            if (detail.state === 'unclaimed') return { status: 'available', message: '检测到可领取' };
+            if (detail.state === 'future') return { status: 'notopen', message: '今日未开放' };
+            return { status: 'skip', message: '状态未知' };
+        }
+        if (detail.status) return detail.status;
+        return { status: 'inactive', message: '未找到今日格子' };
+    } catch (e) { return { status: 'failed', message: `异常：${e.message || e}` }; }
+}
+
+const SITE_PROBES = {
+    'v3x.club': v3xProbe,
+    'dirtybytes.net': DIRTYBYTES_STATUS,
+    'filelist.io': filelistProbe,
+    'myfunzone.org': async () => (await probeEventsPage('myfunzone.org', 'https://myfunzone.org')) || myfunzoneWheelProbe(),
+    'polishtorrent.top': async () => (await probeEventsPage('polishtorrent.top', 'https://polishtorrent.top')) || polishtorrentWheelProbe(),
+    'yu-scene.net': async () => probeEventsPage('yu-scene.net', 'https://yu-scene.net'),
+    'czteam.me': czteamProbe,
+    'seedcore.net': seedcoreProbe,
+    '0dayfiles.net': async () => (has0DayFilesTask()
+        ? { status: 'available', message: '有签到/转盘任务待处理' }
+        : { status: 'already', message: '签到和转盘均已完成' }),
 };
 
 async function probeRemoteSite(host) {
@@ -1280,83 +1381,32 @@ async function probeRemoteSite(host) {
     if (KNOWN_INACTIVE[host] && !getPromoted().includes(host)) {
         return { status: 'inactive', message: KNOWN_INACTIVE[host].reason || '无活动' };
     }
-
-    // 优先走插件化逻辑
     if (SITE_PROBES[host]) {
-        return await SITE_PROBES[host]();
+        // 探针返回空表示"给不出结论"，交给开 tab 的 DOM 流程
+        return (await SITE_PROBES[host]()) || { status: 'pending', message: '该站需开 tab 处理', needsTab: true };
     }
-
     if (cfg.handler !== 'unit3d' && cfg.handler !== 'infinityhd') {
-        if (host === 'yu-scene.net') {
-            const bad = await probeSpecialSiteHealth(host);
-            if (bad) return bad;
-        }
         return { status: 'pending', message: '该站类型需开 tab 处理', needsTab: true };
     }
 
     const base = `https://${host}`;
     const rewardTexts = cfg.rewardLinkText || REWARD_TEXT_PATTERNS_DEFAULT;
 
+    // 1) 配置直接给了详情页
     if (cfg.rewardPath && ACTIVITY_PATH_RE.test(cfg.rewardPath)) {
-        const p = cfg.rewardPath;
-        const detail = await loadEventPage((u, o) => robustFetch(u, o), `${base}${p}`, host);
-        if (detail.netError) return { status: 'failed', message: 'fetch 详情页超时', eventPath: p };
-        if (detail.httpError) return { status: 'failed', message: `GET ${p} → HTTP ${detail.httpStatus}`, eventPath: p };
-        if (detail.status)   return { ...detail.status, eventPath: p };
-        if (!detail.article) return { status: 'inactive', message: '未找到今日格子', eventPath: p };
-        setCachedEventPath(host, p, 'config');
-        const msgs = messagesOf(detail.article);
-        if (detail.state === 'claimed') {
-            const text = msgs.join('，');
-            if (text) addCollectedReward(host, p, text);
-            return { status: 'already', message: text || '今日已领', eventPath: p };
-        }
-        if (detail.state === 'unclaimed') {
-            const claimed = await directClaimFromArticle(base, host, p, detail.article);
-            if (claimed === 'rate-limited') return { status: 'available', message: '限速，需开 tab', eventPath: p };
-            if (claimed) {
-                if (claimed.text) addCollectedReward(host, p, claimed.text);
-                log(`[DirectClaim] ${host} ${p} 后台极速领取成功`);
-                return { status: 'claimed', message: claimed.text || '后台极速领取成功', eventPath: p };
-            }
-            return { status: 'available', message: '检测到可领取', eventPath: p };
-        }
-        if (detail.state === 'future') return { status: 'notopen', message: '今日未开放', eventPath: p };
-        return { status: 'skip', message: '状态未知', eventPath: p };
+        return probeDetail(base, host, cfg.rewardPath, { directClaim: true, cacheSource: 'config' });
     }
-
+    // 2) 配置给的是列表页
     if (cfg.rewardPath && ACTIVITY_LIST_RE.test(cfg.rewardPath)) {
-        let res;
-        try { res = await robustFetch(`${base}${cfg.rewardPath}`); }
-        catch (e) { return probeErrorToStatus(e); }
-        if (res.redirected && /\/(login|auth|signin)/i.test(new URL(res.finalUrl).pathname)) return { status: 'auth', message: '会话已过期' };
-        const httpBad = httpStatusToResult(res, { auth: true });
-        if (httpBad) return httpBad;
-        if (!res.ok) return { status: 'failed', message: `GET ${cfg.rewardPath} → HTTP ${res.status}` };
-        const html = await res.text();
-        const bad = classifyHtml(html);
-        if (bad) return bad;
-        const doc = new DOMParser().parseFromString(html, 'text/html');
-        const listStatus = checkEventList(doc, host);
-        if (listStatus.paths && listStatus.paths.length > 0) return probeEventPaths(host, base, listStatus.paths);
-        if (listStatus.status) return listStatus;
-        return { status: 'inactive', message: '列表页无今日活动' };
+        const r = await probeEventsList(base, host, cfg.rewardPath);
+        return r.error || r.result || (r.list && r.list.status ? r.list : null) || { status: 'inactive', message: '列表页无今日活动' };
     }
-
-    let res;
-    try { res = await robustFetch(`${base}/events`, { timeout: host === 'jme-reunit3d.de' ? 40000 : undefined }); }
-    catch (e) { return probeErrorToStatus(e); }
-    if (res.redirected && /\/(login|auth|signin)/i.test(new URL(res.finalUrl).pathname)) return { status: 'auth', message: '会话已过期' };
-    const httpBad = httpStatusToResult(res, { auth: true });
-    if (httpBad) return httpBad;
-    if (!res.ok) return { status: 'failed', message: `GET /events → HTTP ${res.status}` };
-    const html = await res.text();
-    const bad = classifyHtml(html);
-    if (bad) return bad;
-    const doc = new DOMParser().parseFromString(html, 'text/html');
-    const listStatus = checkEventList(doc, host);
-    if (listStatus.paths && listStatus.paths.length > 0) return probeEventPaths(host, base, listStatus.paths);
-    if (listStatus.status) return listStatus;
+    // 3) 通用：/events 列表 → 详情；列表无今日活动再按页面链接打分
+    const r = await probeEventsList(base, host, '/events');
+    if (r.error) return r.error;
+    if (r.result) return r.result;
+    if (r.list && r.list.status) return r.list;
+    const doc = r.doc;
 
     const textCandidates = [], allCandidates = [];
     for (const a of doc.querySelectorAll('a[href]')) {
@@ -1377,17 +1427,7 @@ async function probeRemoteSite(host) {
         targetPath = allCandidates[0].path;
         targetSource = 'probe-unclaimed';
     }
-    const detail = await loadEventPage((u, o) => robustFetch(u, o), `${base}${targetPath}`, host);
-    if (detail.netError) return { status: 'failed', message: 'fetch 详情页超时', eventPath: targetPath };
-    if (detail.httpError) return { status: 'failed', message: `GET ${targetPath} → HTTP ${detail.httpStatus}`, eventPath: targetPath };
-    if (detail.status) return { ...detail.status, eventPath: targetPath };
-    if (!detail.article) return { status: 'inactive', message: '未找到今日格子', eventPath: targetPath };
-    if (targetSource) setCachedEventPath(host, targetPath, targetSource);
-    const msgs = messagesOf(detail.article);
-    if (detail.state === 'claimed')   return { status: 'already', message: msgs.join('，') || '今日已领', eventPath: targetPath };
-    if (detail.state === 'unclaimed') return { status: 'available', message: '检测到可领取', eventPath: targetPath };
-    if (detail.state === 'future')    return { status: 'notopen', message: '今日未开放', eventPath: targetPath };
-    return { status: 'skip', message: '状态未知', eventPath: targetPath };
+    return probeDetail(base, host, targetPath, { cacheSource: targetSource });
 }
 
 async function probeRemoteSiteWithBudget(host, budgetMs = PROBE_SITE_BUDGET) {
@@ -1400,13 +1440,19 @@ async function probeRemoteSiteWithBudget(host, budgetMs = PROBE_SITE_BUDGET) {
     finally { clearTimeout(timer); }
 }
 
-async function probeAllSitesParallel(hosts, concurrency = 4) {
+function updateScanProgress(done, total, host) {
+    const bar = document.getElementById('pt-progress');
+    if (bar) bar.style.width = `${Math.round(done / total * 100)}%`;
+    const sum = document.getElementById('pt-summary');
+    if (sum) sum.innerHTML = `探测中… ${done}/${total}（当前：${host}）`;
+}
+
+async function probeAllSitesParallel(hosts, concurrency = 6) {
     if (GM_getValue(PROBE_MODE_KEY, 'gm_xhr') === 'tab') return {};
     const results = {};
     let idx = 0, done = 0;
     const total = hosts.length;
     const FORCE_REPROBE = new Set(['filelist.io', 'dirtybytes.net', '0dayfiles.net']);
-    const SLOW_HOSTS = new Set(['dirtybytes.net', 'sextorrent.myds.me']);
 
     // 新增：超时标志位
     let globalTimeout = false;
@@ -1422,8 +1468,7 @@ async function probeAllSitesParallel(hosts, concurrency = 4) {
                     Date.now() - st.ts < TTL_RECHECK) {
                     results[host] = st;
                 } else {
-                    const budget = SLOW_HOSTS.has(host) ? 3000 : PROBE_SITE_BUDGET;
-                    const r = await probeRemoteSiteWithBudget(host, budget);
+                    const r = (await probeRemoteSiteWithBudget(host)) || { status: 'timeout', message: '探测无结果' };
                     if (!r.needsTab) setSiteStatus(host, r);
                     results[host] = r;
                 }
@@ -1431,21 +1476,24 @@ async function probeAllSitesParallel(hosts, concurrency = 4) {
                 results[host] = { status: 'failed', message: e.message };
             }
             done++;
-            const bar = document.getElementById('pt-progress');
-            if (bar) bar.style.width = `${Math.round(done / total * 100)}%`;
-            const sum = document.getElementById('pt-summary');
-            if (sum) sum.innerHTML = `探测中… ${done}/${total}（当前：${host}）`;
+            updateScanProgress(done, total, host);
             await sleep(150 + Math.random() * 250);
         }
     }
 
+    // 固定 60s 对 57 个站点不够用（日志里 7 次扫描有 4 次被截断），按站点数放宽
+    const budgetMs = Math.min(150000, Math.max(90000, total * 2500));
     const timer = setTimeout(() => {
         globalTimeout = true;
-        log('[Scan] 阶段 1 探测达到 60 秒全局超时，强制进入下一阶段');
-    }, 60000);
+        log(`[Scan] 阶段 1 全局超时 ${Math.round(budgetMs / 1000)}s（已完成 ${done}/${total}），进入下一阶段`);
+    }, budgetMs);
 
     await Promise.all(Array.from({ length: concurrency }, worker));
     clearTimeout(timer);
+    // 全局超时被截断的站点补状态，避免"没有结果"被当成已处理
+    for (const h of hosts) {
+        if (!results[h]) results[h] = { status: 'timeout', message: '扫描整体超时，本站未探测' };
+    }
     return results;
 }
 
@@ -1572,6 +1620,12 @@ async function navigateToUnit3DEventPage(cfg) {
         clearCachedEventPath(HOST);
         return { status: 'skip', message: '特殊活动页面（刮刮卡），已跳过' };
     }
+    function navGuard(path) {
+        if (canNavigateTo(path)) return null;
+        log(`[Nav] 检测到循环跳转 ${path}（30s 内 ≥3 次），放弃`);
+        clearCachedEventPath(HOST);
+        return { status: 'failed', message: `循环跳转 ${path}，giveaway 状态异常` };
+    }
     function canNavigateTo(path) {
         const key = 'pt_nav_guard_' + HOST + '_' + path;
         const now = Date.now();
@@ -1586,11 +1640,8 @@ async function navigateToUnit3DEventPage(cfg) {
     }
     const cached = getCachedEventPath(HOST);
     if (cached && ACTIVITY_PATH_RE.test(cached)) {
-        if (!canNavigateTo(cached)) {
-            log(`[Nav] 检测到循环跳转 ${cached}（30s 内 ≥3 次），放弃`);
-            clearCachedEventPath(HOST);
-            return { status: 'failed', message: `循环跳转 ${cached}，giveaway 状态异常` };
-        }
+        const bad = navGuard(cached);
+        if (bad) return bad;
         location.href = `${base}${cached}${hash}`;
         return { status: 'navigating' };
     }
@@ -1600,11 +1651,8 @@ async function navigateToUnit3DEventPage(cfg) {
             if (listStatus.paths.length > 1) setPendingEvents(HOST, listStatus.paths);
             const path = listStatus.paths[0];
             setCachedEventPath(HOST, path, 'remote-hint');
-            if (!canNavigateTo(path)) {
-                log(`[Nav] 检测到循环跳转 ${path}（30s 内 ≥3 次），放弃`);
-                clearCachedEventPath(HOST);
-                return { status: 'failed', message: `循环跳转 ${path}，giveaway 状态异常` };
-            }
+            const bad = navGuard(path);
+            if (bad) return bad;
             location.href = `${base}${path}${hash}`;
             return { status: 'navigating' };
         }
@@ -1669,22 +1717,29 @@ async function finishUnit3DClaim(form, button) {
     return { status: 'navigating' };
 }
 
-const claimUnit3DEventPage = guardLogin(async () => {
+/** Unit3D 详情页公共前置判断：服务端隐藏提示 / giveaway 失效 */
+function unit3dPagePrecheck(tag) {
     const errorCopy = document.getElementById('ERROR_COPY');
     if (errorCopy && errorCopy.textContent.includes('Event is not active')) {
-        log(`[Unit3D] 检测到服务端隐藏提示 Event is not active，终止重试`);
+        log(`[${tag}] 检测到服务端隐藏提示 Event is not active，终止重试`);
         clearCachedEventPath(HOST);
         removePendingEvent(HOST, location.pathname);
         return { status: 'notopen', message: '站点提示活动未激活（时间未到或已关闭）' };
     }
-
-    if (isMaintenancePage(document.documentElement.outerHTML)) return { status: 'maintenance', message: '站点维护中' };
     const bodyText = (document.body?.innerText || '').toLowerCase();
     if (/giveaway\s+(?:is\s+)?not\s+active|no\s+longer\s+active|not\s+currently\s+active/i.test(bodyText)) {
+        log(`[${tag}] 页面提示 giveaway 已失效`);
         clearCachedEventPath(HOST);
         removePendingEvent(HOST, location.pathname);
         return { status: 'inactive', message: 'giveaway is not active' };
     }
+    return null;
+}
+
+const claimUnit3DEventPage = guardLogin(async () => {
+    const pre = unit3dPagePrecheck('Unit3D');
+    if (pre) return pre;
+    if (isMaintenancePage(document.documentElement.outerHTML)) return { status: 'maintenance', message: '站点维护中' };
 
     await waitForEventArticles();
     const todayArt = findTodayArticle();
@@ -1732,20 +1787,8 @@ const claimUnit3DEventPage = guardLogin(async () => {
 });
 
 async function handleMultiEventClaim() {
-    const errorCopy = document.getElementById('ERROR_COPY');
-    if (errorCopy && errorCopy.textContent.includes('Event is not active')) {
-        log(`[MultiEvent] 检测到服务端隐藏提示 Event is not active，终止重试`);
-        clearCachedEventPath(HOST);
-        removePendingEvent(HOST, location.pathname);
-        return { status: 'notopen', message: '站点提示活动未激活（时间未到或已关闭）' };
-    }
-
-    const bodyText = (document.body?.innerText || '').toLowerCase();
-    if (/giveaway\s+(?:is\s+)?not\s+active|no\s+longer\s+active|not\s+currently\s+active/i.test(bodyText)) {
-        clearCachedEventPath(HOST);
-        removePendingEvent(HOST, location.pathname);
-        return { status: 'inactive', message: 'giveaway is not active' };
-    }
+    const pre = unit3dPagePrecheck('MultiEvent');
+    if (pre) return pre;
 
     await waitForEventArticles();
     await sleep(300);
@@ -1944,22 +1987,7 @@ function parseDirtyBytesLastClaim(str) {
     const t = new Date(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}+08:00`);
     return isNaN(t.getTime()) ? null : t;
 }
-const claimOnDirtyBytes = guardLogin(async () => {
-    try {
-        const res = await robustFetch(`${DIRTYBYTES_ORIGIN}${DIRTYBYTES_API}`, { credentials: 'include' }, FETCH_TIMEOUT, 2);
-        if (looksLikeLoginResponse(res)) return { status: 'auth', message: '会话已过期，需要重新登录' };
-        if (!res.ok) return { status: 'failed', message: `API HTTP ${res.status}` };
-        const bonus = (await res.json())?.user?.dailyLoginBonusStatus;
-        if (!bonus) return { status: 'skip', message: '未找到每日登录奖励数据' };
-        const { streak = 0, cycleDay = 0, daysInCycle = 7, nextPoints = 0, progressPercent = 0 } = bonus;
-        if (bonus.claimedToday) {
-            const t = parseDirtyBytesLastClaim(bonus.lastClaim);
-            const lastClaimStr = t ? fmtClock(t.getTime()) : '今日';
-            return { status: 'already', message: `连续 ${streak} 天 · 周期 ${cycleDay}/${daysInCycle} · 进度 ${progressPercent}% · 下次 +${nextPoints}p · 上次 ${lastClaimStr}` };
-        }
-        return { status: 'available', message: `待登录发放 · 连续 ${streak} 天 · 下次 +${nextPoints}p` };
-    } catch (e) { return { status: 'failed', message: `异常：${e.message || e}` }; }
-});
+const claimOnDirtyBytes = guardLogin(DIRTYBYTES_STATUS);
 
 const claimOn0DayFilesAttendance = guardLogin(async () => {
     const storedReward = sessionStorage.getItem('pt_0df_attendance_reward');
@@ -2036,9 +2064,9 @@ const claimOn0DayFilesSpinWheel = guardLogin(async () => {
     await waitFor(() => data.config && data.config.next !== undefined, 5000);
     const nextSec = data.next;
     if (nextSec && nextSec * 1000 > Date.now() + 30 * 1000) {
-        const nextMs = nextSec * 1000;
+        const nextMs = saneNextTs(nextSec * 1000);
         GM_setValue(SPINWHEEL_NEXT_KEY, nextMs);
-        return { status: 'already', message: cooldownText(GM_getValue(SPINWHEEL_LAST_REWARD_KEY, '未知'), nextMs) };
+        return { status: 'already', message: cooldownText(GM_getValue(SPINWHEEL_LAST_REWARD_KEY, '未知') || '未知', nextMs) };
     }
     const btn = document.querySelector('.sw-hub') || document.querySelector('form button.sw-btn');
     if (!btn) return { status: 'skip', message: '未找到 Spin 按钮' };
@@ -2046,7 +2074,7 @@ const claimOn0DayFilesSpinWheel = guardLogin(async () => {
     try { if (typeof data.spin === 'function') data.spin(); else btn.click(); }
     catch (e) { return { status: 'failed', message: `触发 Spin 失败：${e.message || e}` }; }
     const result = await waitFor(() => data.result || (data.error ? { __err: data.error } : null), 20000);
-    if (data.next) GM_setValue(SPINWHEEL_NEXT_KEY, data.next * 1000);
+    if (data.next) GM_setValue(SPINWHEEL_NEXT_KEY, saneNextTs(data.next * 1000));
     if (!result) return { status: 'failed', message: '旋转后未等到结果' };
     if (result.__err) return { status: 'failed', message: `服务端返回：${result.__err}` };
     const reward = result.nothing ? 'Nothing' : (result.label || '未知奖励');
@@ -2090,7 +2118,7 @@ const claimOnYusceneSpinWheel = guardLogin(async () => {
     const isNothing = /nothing/i.test(reward);
     const nextTime = (statusText.match(/Next spin available\s+(.+?)\s*\(/) || [])[1] || '';
     const nextTs = parseYusceneNextTs(statusText, nextTime);
-    GM_setValue(YUSCENE_SPIN_NEXT_KEY, nextTs > Date.now() ? nextTs : 0);
+    GM_setValue(YUSCENE_SPIN_NEXT_KEY, saneNextTs(nextTs));
     if (nextTs && nextTs > Date.now() + 30 * 1000) {
         return {
             status: 'already',
@@ -2154,6 +2182,10 @@ async function claimYuscenePumpkin() {
     }
     const pumpkin = await waitFor(() => document.getElementById('halloween-bon'), 5000, 250);
     if (!pumpkin) {
+        // 维护页/半加载页也会没有该元素，别据此永久下线
+        if (isMaintenanceText(document.body?.innerText || '')) {
+            return done({ status: 'maintenance', message: '站点维护中，南瓜状态未知' });
+        }
         GM_setValue(PUMPKIN_RETIRED_KEY, true);
         log('[YuScene] 未检测到 #halloween-bon，标记南瓜为已下线（万圣节活动结束）');
         return done({ status: 'already', message: '万圣节南瓜活动已结束' });
@@ -2161,6 +2193,10 @@ async function claimYuscenePumpkin() {
     if (pumpkin.dataset.busy === '1') {
         GM_setValue(PUMPKIN_LAST_CLAIM_KEY, Date.now());
         return done({ status: 'already', message: '南瓜正在处理中' });
+    }
+    const attempt = bumpPumpkinAttempt();
+    if (attempt > PUMPKIN_MAX_ATTEMPTS) {
+        return done({ status: 'skip', message: `今日已尝试 ${PUMPKIN_MAX_ATTEMPTS} 次仍未确认到奖励，明日再试` });
     }
     const beforeText = (pumpkin.querySelector('.halloween-bon__amount')?.textContent || '').trim();
     try { pumpkin.click(); }
@@ -2171,14 +2207,22 @@ async function claimYuscenePumpkin() {
         const txt = (el.querySelector('.halloween-bon__amount')?.textContent || '').trim();
         return (txt && txt !== beforeText) ? { type: 'reward', text: txt } : null;
     }, 10000, 200);
-    GM_setValue(PUMPKIN_LAST_CLAIM_KEY, Date.now());
     if (result && result.type === 'reward') {
+        GM_setValue(PUMPKIN_LAST_CLAIM_KEY, Date.now());
         GM_setValue(PUMPKIN_LAST_REWARD_KEY, result.text);
         showToast(`🎃 万圣节南瓜：${result.text}`);
         return done({ status: 'claimed', message: `🎃 南瓜：${result.text}` });
     }
-    if (result && result.type === 'removed') return done({ status: 'already', message: '南瓜已消失（今日可能已领）' });
-    return done({ status: 'claimed', message: '已触发点击（未捕获到文本）' });
+    if (result && result.type === 'removed') {
+        GM_setValue(PUMPKIN_LAST_CLAIM_KEY, Date.now());
+        return done({ status: 'already', message: '南瓜已消失（今日可能已领）' });
+    }
+    // 没抓到文本就不写"已领"，否则会被 20h 冷却挡住真实重试；用当日次数止损
+    return done({
+        status: 'skip',
+        message: `已点击南瓜但未捕获奖励文本（今日第 ${attempt} 次）` +
+                 (attempt >= PUMPKIN_MAX_ATTEMPTS ? '，今日不再重试' : `，${PUMPKIN_RETRY_GAP / MIN} 分钟后再试`),
+    });
 }
 
 const claimOnFilelist = guardLogin(async () => {
@@ -2186,24 +2230,17 @@ const claimOnFilelist = guardLogin(async () => {
     if (nav) return nav;
 
     const bodyText = document.body.innerText || '';
-
-    if (/This event has ended|Please check again later/i.test(bodyText)) {
-        return { status: 'inactive', message: '转盘活动已结束' };
-    }
-
-    const cooldownMatch = bodyText.match(/Please check back again in\s*(?:(\d+)h\s*)?(?:(\d+)m\s*)?(?:(\d+)s)?/i);
-    if (cooldownMatch) {
-        const h = parseInt(cooldownMatch[1] || '0', 10);
-        const m = parseInt(cooldownMatch[2] || '0', 10);
-        const s = parseInt(cooldownMatch[3] || '0', 10);
-        const nextTs = Date.now() + (h * 3600 + m * 60 + s) * 1000;
-        GM_setValue(FILELIST_SPIN_NEXT_KEY, nextTs);
-        return { status: 'already', message: cooldownText(GM_getValue(FILELIST_LAST_REWARD_KEY, '未知'), nextTs, false) };
+    if (FILELIST_ENDED_RE.test(bodyText)) return { status: 'inactive', message: '转盘活动已结束' };
+    const nextTs = filelistCooldownTs(bodyText);
+    if (nextTs) {
+        GM_setValue(FILELIST_SPIN_NEXT_KEY, saneNextTs(nextTs, 26));
+        return { status: 'already', message: cooldownText(GM_getValue(FILELIST_LAST_REWARD_KEY, '未知') || '未知', nextTs, false) };
     }
 
     const btn = document.querySelector('#spin');
     if (!btn) return { status: 'skip', message: '未找到 Spin 按钮' };
 
+    // 站点用 alert 弹奖励，临时劫持
     let interceptedMsg = null;
     const origAlert = window.alert;
     window.alert = msg => { interceptedMsg = msg; };
@@ -2216,20 +2253,19 @@ const claimOnFilelist = guardLogin(async () => {
     window.alert = origAlert;
     if (!result) return { status: 'timeout', message: '未捕获到奖励弹窗' };
     const match = result.match(/You just won\s*(.+?)!/i);
-    if (match) {
-        const reward = match[1].trim();
-        GM_setValue(FILELIST_LAST_REWARD_KEY, reward);
-        GM_setValue(FILELIST_SPIN_NEXT_KEY, Date.now() + 24 * HOUR);
-        return { status: 'claimed', message: `本次：${reward}` };
-    }
-    return { status: 'claimed', message: '已触发（未解析出具体奖励）' };
+    if (!match) return { status: 'claimed', message: '已触发（未解析出具体奖励）' };
+    const reward = match[1].trim();
+    GM_setValue(FILELIST_LAST_REWARD_KEY, reward);
+    GM_setValue(FILELIST_SPIN_NEXT_KEY, Date.now() + 24 * HOUR);
+    return { status: 'claimed', message: `本次：${reward}` };
 });
 
-const claimOnMyFunZoneWheel = guardLogin(async () => {
+/** 多活动站点：先领 /events 今日活动，没有则落到转盘页（myfunzone / polishtorrent 共用） */
+async function claimEventsThenWheel(wheelPath) {
     if (isOnEventPage()) {
         const r = await handleMultiEventClaim();
-        if (r && ['inactive', 'notopen', 'skip'].includes(r.status) && !isNavigating(r)) {
-            location.href = location.origin + '/wheel' + CLAIM_HASH;
+        if (r && ['inactive', 'notopen', 'skip'].includes(r.status)) {
+            location.href = location.origin + wheelPath + CLAIM_HASH;
             return { status: 'navigating' };
         }
         return r;
@@ -2241,18 +2277,22 @@ const claimOnMyFunZoneWheel = guardLogin(async () => {
             location.href = location.origin + list.paths[0] + CLAIM_HASH;
             return { status: 'navigating' };
         }
-        location.href = location.origin + '/wheel' + CLAIM_HASH;
+        location.href = location.origin + wheelPath + CLAIM_HASH;
         return { status: 'navigating' };
     }
+    return null;
+}
+
+const claimOnMyFunZoneWheel = guardLogin(async () => {
+    const early = await claimEventsThenWheel('/wheel');
+    if (early) return early;
+
     const nav = ensurePath('/wheel', '/wheel');
     if (nav) return nav;
     await waitFor(() => document.getElementById('dw-fab') || document.getElementById('dw-spin'), 8000);
-    const fab = document.getElementById('dw-fab');
-    const spinBtn = document.getElementById('dw-spin');
-    const isFabAvailable = fab && fab.querySelector('b') && parseInt(fab.querySelector('b').textContent) > 0;
-    const isBtnAvailable = spinBtn && !spinBtn.disabled && spinBtn.textContent.includes('SPIN THE WHEEL');
-    const isDone = (spinBtn && spinBtn.textContent.includes('SEE YOU TOMORROW')) || (!fab && !isBtnAvailable);
-    if (!isFabAvailable && !isBtnAvailable && isDone) {
+
+    const s = myfunzoneWheelState(document);
+    if (!s.fabReady && !s.btnReady && s.done) {
         let nextTs = GM_getValue(MYFUNZONE_SPIN_NEXT_KEY, 0);
         if (nextTs <= Date.now()) {
             nextTs = Date.now() + 24 * HOUR;
@@ -2260,83 +2300,64 @@ const claimOnMyFunZoneWheel = guardLogin(async () => {
         }
         return { status: 'already', message: `今日已领 · 下次：${fmtClock(nextTs)}` };
     }
-    if ((!spinBtn || spinBtn.offsetParent === null) && fab && fab.offsetParent !== null) {
-        fab.click();
+    if ((!s.spinBtn || s.spinBtn.offsetParent === null) && s.fab && s.fab.offsetParent !== null) {
+        s.fab.click();
         await sleep(600);
     }
     const targetBtn = document.getElementById('dw-spin');
     if (!targetBtn) return { status: 'skip', message: '未找到转盘按钮' };
     if (targetBtn.disabled) return { status: 'already', message: '今日已领取' };
-    let capturedJson = null;
+
+    // 抓 /wheel/spin 的响应，比解析文案可靠
+    let captured = null;
     const origFetch = window.fetch;
-    window.fetch = async function(...args) {
+    window.fetch = async function (...args) {
         const response = await origFetch.apply(this, args);
         if (args[0] && String(args[0]).includes('/wheel/spin')) {
-            try {
-                const clone = response.clone();
-                capturedJson = await clone.json();
-            } catch (e) {}
+            try { captured = await response.clone().json(); } catch (e) {}
         }
         return response;
     };
-    try { targetBtn.click(); } catch (e) {
+    try { targetBtn.click(); }
+    catch (e) {
         window.fetch = origFetch;
         return { status: 'failed', message: `点击失败：${e.message}` };
     }
     const result = await waitFor(() => {
-        if (capturedJson) return { type: 'json', data: capturedJson };
+        if (captured) return { type: 'json', data: captured };
         const sub = document.getElementById('dw-sub');
-        if (sub) {
-            if (sub.textContent.includes('You won:')) {
-                const match = sub.textContent.match(/You won:\s*(.+?)!/i);
-                return { type: 'win', label: match ? match[1] : '未知' };
-            }
-            if (sub.textContent.includes('Something went wrong') || sub.textContent.includes('Network error')) {
-                return { type: 'error', label: sub.textContent };
-            }
-            if (sub.textContent.includes('SEE YOU TOMORROW')) return { type: 'done' };
+        if (!sub) return null;
+        const t = sub.textContent;
+        if (t.includes('You won:')) {
+            const m = t.match(/You won:\s*(.+?)!/i);
+            return { type: 'win', label: m ? m[1] : '未知' };
         }
+        if (t.includes('Something went wrong') || t.includes('Network error')) return { type: 'error', label: t };
+        if (t.includes('SEE YOU TOMORROW')) return { type: 'done' };
         return null;
     }, 20000, 200);
     window.fetch = origFetch;
     GM_setValue(MYFUNZONE_SPIN_NEXT_KEY, Date.now() + 24 * HOUR);
-    if (result) {
-        if (result.type === 'json') {
-            if (result.data.ok) return { status: 'claimed', message: `本次：${result.data.label || '未知'}` };
-            return { status: 'already', message: result.data.message || '今日已领取' };
-        }
-        if (result.type === 'win') return { status: 'claimed', message: `本次：${result.label}` };
-        if (result.type === 'done') return { status: 'claimed', message: '转盘已执行' };
-        if (result.type === 'error') return { status: 'failed', message: result.label };
+
+    if (!result) return { status: 'timeout', message: '旋转结果超时，请手动确认' };
+    if (result.type === 'json') {
+        return result.data.ok
+            ? { status: 'claimed', message: `本次：${result.data.label || '未知'}` }
+            : { status: 'already', message: result.data.message || '今日已领取' };
     }
-    return { status: 'timeout', message: '旋转结果超时，请手动确认' };
+    if (result.type === 'win') return { status: 'claimed', message: `本次：${result.label}` };
+    if (result.type === 'done') return { status: 'claimed', message: '转盘已执行' };
+    return { status: 'failed', message: result.label };
 });
 
 const claimOnPolishTorrentWheel = guardLogin(async () => {
-    if (isOnEventPage()) {
-        const r = await handleMultiEventClaim();
-        if (r && ['inactive', 'notopen', 'skip'].includes(r.status) && !isNavigating(r)) {
-            location.href = location.origin + '/spin' + CLAIM_HASH;
-            return { status: 'navigating' };
-        }
-        return r;
-    }
-    if (location.pathname === '/events' || location.pathname === '/events/') {
-        const list = checkEventList(document, HOST);
-        if (list.paths && list.paths.length) {
-            if (list.paths.length > 1) setPendingEvents(HOST, list.paths);
-            location.href = location.origin + list.paths[0] + CLAIM_HASH;
-            return { status: 'navigating' };
-        }
-        location.href = location.origin + '/spin' + CLAIM_HASH;
-        return { status: 'navigating' };
-    }
-    const btn = document.getElementById('spinBtn');
-    if (!btn) return { status: 'inactive', message: '未找到转盘按钮（页面结构可能已变化）' };
-    if (btn.disabled) {
-        const last = document.querySelector('.spin-already strong')?.textContent?.trim() || '';
-        return { status: 'already', message: last ? `今日已领取 · 上次：${last}` : '今日已领取' };
-    }
+    const early = await claimEventsThenWheel('/spin');
+    if (early) return early;
+
+    const s = polishWheelState(document);
+    if (s.state === 'missing') return { status: 'inactive', message: '未找到转盘按钮（页面结构可能已变化）' };
+    if (s.state === 'already') return { status: 'already', message: s.last ? `今日已领取 · 上次：${s.last}` : '今日已领取' };
+
     const csrfToken = getCsrfToken();
     if (!csrfToken) return { status: 'failed', message: '未找到 CSRF Token' };
     try {
@@ -2347,13 +2368,11 @@ const claimOnPolishTorrentWheel = guardLogin(async () => {
         if (!res.ok) return { status: 'failed', message: `请求失败 HTTP ${res.status}` };
         const data = await res.json();
         if (data.error) return { status: 'already', message: data.error };
-        if (data.success) {
-            const prize = data.prize;
-            GM_setValue('pt_polishtorrent_last_reward', prize.label);
-            if (prize.type === 'nothing') return { status: 'empty', message: '本次：Pech!（空礼物）' };
-            return { status: 'claimed', message: `本次：${prize.label}` };
-        }
-        return { status: 'failed', message: '未知响应格式' };
+        if (!data.success) return { status: 'failed', message: '未知响应格式' };
+        const prize = data.prize || {};
+        if (prize.label) GM_setValue(POLISH_LAST_REWARD_KEY, prize.label);
+        if (prize.type === 'nothing') return { status: 'empty', message: '本次：Pech!（空礼物）' };
+        return { status: 'claimed', message: `本次：${prize.label || '未知奖励'}` };
     } catch (e) {
         return { status: 'failed', message: `请求异常：${e.message}` };
     }
@@ -2405,7 +2424,7 @@ function checkDailyReset() {
     clearCachedEventPath(HOST);
     clearPendingEvents(HOST);
     if (HOST === 'yu-scene.net') {
-        for (const k of [PUMPKIN_STATUS_KEY, PUMPKIN_LAST_CLAIM_KEY, PUMPKIN_LAST_REWARD_KEY, YUSCENE_SPIN_NEXT_KEY]) GM_deleteValue(k);
+        for (const k of [PUMPKIN_STATUS_KEY, PUMPKIN_LAST_CLAIM_KEY, PUMPKIN_LAST_REWARD_KEY, PUMPKIN_ATTEMPT_KEY, YUSCENE_SPIN_NEXT_KEY]) GM_deleteValue(k);
     }
     if (HOST === '0dayfiles.net') {
         GM_deleteValue(ATTENDANCE_LAST_CONFIRMED_KEY);
@@ -2436,7 +2455,7 @@ const RESET_GLOBAL_KEYS = [
     ATTENDANCE_LAST_CONFIRMED_KEY, ATTENDANCE_LAST_ATTEMPT_KEY, ATTENDANCE_LAST_REWARD_KEY,
     AUTO_SCAN_TIME_KEY, TASK_LOCK_KEY,
     MYFUNZONE_SPIN_NEXT_KEY, PUMPKIN_LAST_CLAIM_KEY, PUMPKIN_LAST_REWARD_KEY,
-    PUMPKIN_RETIRED_KEY,
+    PUMPKIN_ATTEMPT_KEY,   // 活动是否已下线（PUMPKIN_RETIRED_KEY）属于事实，不随"重置今日状态"复活
     YUSCENE_SPIN_NEXT_KEY, PUMPKIN_STATUS_KEY, FILELIST_SPIN_NEXT_KEY,
 ];
 function resetAllStatuses() {
@@ -2451,7 +2470,6 @@ function resetAllStatuses() {
     GM_setValue(SPINWHEEL_NEXT_KEY, 0);
     GM_setValue(SPINWHEEL_LAST_REWARD_KEY, '');
     GM_setValue(FILELIST_LAST_REWARD_KEY, '');
-    reprobeAttempted.clear();
     try {
         sessionStorage.removeItem(SEEDCORE_BUBBLE_BEFORE);
         sessionStorage.removeItem('pt_0df_attendance_reward');
@@ -2474,9 +2492,6 @@ function clearHostCache(host) {
     for (const p of PREFIXED) GM_deleteValue(p + host);
     GM_deleteValue(keyFor(host, 'pumpkin'));
     GM_deleteValue(lastOpenDateKey(host));
-    const KNOWN_PATHS = ['/events', '/giveaways'];
-    for (let i = 1; i <= 30; i++) KNOWN_PATHS.push(`/events/${i}`, `/giveaways/${i}`);
-    for (const p of KNOWN_PATHS) GM_deleteValue('pt_nav_guard_' + host + '_' + p);
     const HOST_ONLY = {
         'yu-scene.net': { keys: ['pt_yuscene_spin_next_v1', 'pt_yuscene_pumpkin_status_v1', 'pt_pumpkin_last_claim_v1', 'pt_pumpkin_last_reward_v1', 'pt_pumpkin_retired_v1'] },
         'myfunzone.org': { keys: ['pt_myfunzone_spin_next_v1'] },
@@ -2518,24 +2533,21 @@ function waitForSiteDone(host, timeout = SEQUENTIAL_TIMEOUT) {
             return false;
         };
         if (check()) return;
-        timer = setInterval(check, 100);
+        timer = setInterval(check, 250);
         try { listenerId = GM_addValueChangeListener(keyFor(host), () => check()); } catch (e) {}
         hardTimer = setTimeout(() => { if (!settled) finish({ status: 'timeout', message: '硬性超时' }); }, timeout + HARD_TIMEOUT_MARGIN);
     });
 }
 
 function getScanTargets(excludeHost) {
-    const promoted = getPromoted(), demoted = getAutoDemoted();
-    const set = new Set();
-    for (const h of Object.keys(SITES)) if (!demoted.includes(h)) set.add(h);
-    for (const h of Object.keys(KNOWN_INACTIVE)) if (!promoted.includes(h)) set.add(h);
-    for (const h of demoted) set.add(h);
-    if (excludeHost) set.delete(excludeHost);
-    return [...set];
+    const { scan } = siteSets();
+    if (excludeHost) scan.delete(excludeHost);
+    return [...scan];
 }
 
 const has0DayFilesTask = () => !attendanceDone() || GM_getValue(SPINWHEEL_NEXT_KEY, 0) <= Date.now();
-const hasYusceneTask = () => !(yusceneWheelDone() && pumpkinDone());
+// 转盘才是任务；南瓜是顺带试一次的附加动作，不能让它单独把 yu-scene 永久钉在任务列表里
+const hasYusceneTask = () => !yusceneWheelDone();
 const hasFilelistTask = () => GM_getValue(FILELIST_SPIN_NEXT_KEY, 0) <= Date.now();
 
 const NEXT_TS_TABS = [
@@ -2567,7 +2579,7 @@ function checkYusceneSpin() {
     if (nextTs <= Date.now()) {
         GM_setValue(YUSCENE_SPIN_NEXT_KEY, 0);
         spawnClaimTab('https://yu-scene.net/prize-wheel' + CLAIM_HASH);
-    } else if (!pumpkinDone()) {
+    } else if (pumpkinRetryable()) {
         spawnClaimTab('https://yu-scene.net/' + PUMPKIN_HASH);
     }
 }
@@ -2595,17 +2607,17 @@ function maybeAutoScan() {
 async function withTab(host, url, timeout, tabKey = host) {
     // 优化：强制静默打开标签页
     const isAuto = isAutoOpenedTab() || location.hash === CLAIM_HASH || location.hash === DETECT_HASH;
-    openTab(tabKey, url, { active: !isAuto, insert: false, setParent: true });
+    openTabQ(tabKey, url, !isAuto);
     await waitForSiteDone(host, timeout);
     closeTab(tabKey);
     return getSiteStatus(host);
 }
 
 async function runPumpkinTab(host, { active = false, waitMs = 20000 } = {}) {
-    if (pumpkinDone()) return false;
+    if (!pumpkinRetryable()) return false;
     const key = host + '#pumpkin';
     closeTab(key); // 👈 新增：打开前先强制清理可能残留的旧标签页
-    openTab(key, buildClaimUrl(host, 'pumpkin'), active, { insert: false, setParent: true });
+    openTabQ(key, buildClaimUrl(host, 'pumpkin'), active);
     const start = Date.now();
     while (Date.now() - start < waitMs) {
         if (pumpkinDone()) break;
@@ -2703,7 +2715,7 @@ async function runSequential(hosts, { taskName, activeTab, pendingMessage, state
             const host = hosts[i];
             setSiteStatus(host, { status: 'pending', message: pendingMessage });
             // 优化：强制静默打开
-            openTab(host, buildClaimUrl(host), activeTab, { insert: false, setParent: true });
+            openTabQ(host, buildClaimUrl(host), activeTab);
             const result = await waitForSiteDone(host);
             if (result.status === 'timeout' && !isTerminal(getSiteStatus(host))) {
                 setSiteStatus(host, { status: 'timeout', message: result.message || '超时' });
@@ -2750,24 +2762,36 @@ async function startAllParallel() {
     }
     const hosts = pickWorkHosts();
     if (!hosts.length) { releaseTaskLock(); alert('没有需要领取的活跃站点'); return; }
-    for (const host of hosts) setSiteStatus(host, { status: 'pending', message: '等待中...' });
-    const batchSize = 3;
-    for (let i = 0; i < hosts.length; i += batchSize) {
-        hosts.slice(i, i + batchSize).forEach((host, j) => {
-            setTimeout(() => {
-                if (host === 'yu-scene.net' && ['maintenance', 'failed'].includes(getSiteStatus(host).status)) {
-                    log(`[Parallel] ${host} 状态为 ${getSiteStatus(host).status}，跳过`);
+
+    isSequentialRunning = true;
+    renderStats(); toggleButtons(true);
+    try {
+        const batchSize = 3;
+        for (let i = 0; i < hosts.length; i += batchSize) {
+            const batch = hosts.slice(i, i + batchSize);
+            for (const host of batch) setSiteStatus(host, { status: 'pending', message: '等待中...' });
+            batch.forEach((host, j) => setTimeout(() => {
+                const st = getSiteStatus(host);
+                if (host === 'yu-scene.net' && ['maintenance', 'failed'].includes(st.status)) {
+                    log(`[Parallel] ${host} 状态为 ${st.status}，跳过`);
                     return;
                 }
-                openTab(host, buildClaimUrl(host), false, { insert: false, setParent: true });
-                if (host === 'yu-scene.net' && !pumpkinDone()) {
-                    openTab(host + '#pumpkin', buildClaimUrl(host, 'pumpkin'), false, { insert: false, setParent: true });
+                openTabQ(host, buildClaimUrl(host), false);
+                if (host === 'yu-scene.net' && pumpkinRetryable()) {
+                    openTabQ(host + '#pumpkin', buildClaimUrl(host, 'pumpkin'), false);
                 }
-            }, j * OPEN_TAB_INTERVAL);
-        });
-        await sleep(batchSize * OPEN_TAB_INTERVAL + 5000);
+            }, j * OPEN_TAB_INTERVAL));
+            await sleep(batchSize * OPEN_TAB_INTERVAL + 5000);
+        }
+        // 等所有站点落定再放锁，否则别的标签页会在领取途中又起一轮扫描
+        await Promise.all(hosts.map(h => waitForSiteDone(h)));
+    } finally {
+        for (const h of hosts) { closeTab(h); closeTab(h + '#pumpkin'); }
+        isSequentialRunning = false;
+        releaseTaskLock();
+        toggleButtons(false);
+        refreshUI();
     }
-    setTimeout(() => releaseTaskLock(), 5000);
 }
 
 // ==========================================
@@ -2827,7 +2851,7 @@ function mountPanel() {
     // 默认折叠
     const collapsedNow = GM_getValue(COLLAPSE_KEY, true) === true;
     const filled = tpl
-        .replace(/\{\{\s*TODAY\s*\}\}/g, TODAY)
+        .replace(/\{\{\s*TODAY\s*\}\}/g, getSiteToday(HOST))
         .replace(/\{\{\s*TOGGLE_ICON\s*\}\}/g, collapsedNow ? '▸' : '▾')
         .replace(/\{\{\s*AUTO_SCAN_CHECKED\s*\}\}/g, GM_getValue(AUTO_SCAN_ENABLED, true) === true ? 'checked' : '');
     const box = document.createElement('div');
@@ -2844,9 +2868,9 @@ function mountPanel() {
 
 async function openYusceneTab(mode) {
     const pumpkin = mode === 'pumpkin';
-    if (pumpkin && pumpkinDone()) return;
+    if (pumpkin && !pumpkinRetryable()) return;
     const tabKey = pumpkin ? 'yu-scene.net#pumpkin' : 'yu-scene.net';
-    openTab(tabKey, buildClaimUrl('yu-scene.net', pumpkin ? 'pumpkin' : 'claim'), true);
+    openTabQ(tabKey, buildClaimUrl('yu-scene.net', pumpkin ? 'pumpkin' : 'claim'), true);
     const start = Date.now();
     await waitFor(() => {
         const st = pumpkin ? getPumpkinStatus() : getSiteStatus('yu-scene.net');
@@ -2856,9 +2880,9 @@ async function openYusceneTab(mode) {
 }
 function retryHost(host) {
     setSiteStatus(host, { status: 'pending', message: '等待重试...' });
-    openTab(host, buildClaimUrl(host));
-    if (host === 'yu-scene.net' && !pumpkinDone()) {
-        openTab(host + '#pumpkin', buildClaimUrl(host, 'pumpkin'));
+    openTabQ(host, buildClaimUrl(host));
+    if (host === 'yu-scene.net' && pumpkinRetryable()) {
+        openTabQ(host + '#pumpkin', buildClaimUrl(host, 'pumpkin'));
     }
 }
 async function checkHost(host) {
@@ -2903,7 +2927,7 @@ function renderDashboard() {
         const toggleBtn = $('pt-toggle') || root.querySelector('.pt-toggle');
         const dateEl = $('pt-date') || root.querySelector('.pt-sub');
         const setToggleIcon = c => { if (toggleBtn) toggleBtn.textContent = c ? '▸' : '▾'; };
-        if (dateEl) dateEl.textContent = TODAY;
+        if (dateEl) dateEl.textContent = getSiteToday(HOST);
         setToggleIcon(collapsed);
         const autoBox = $('pt-toggle-autoscan');
         if (autoBox) autoBox.checked = GM_getValue(AUTO_SCAN_ENABLED, true) === true;
@@ -2950,7 +2974,15 @@ function setupListeners() {
     for (const k of keys) GM_addValueChangeListener(k, refresh);
 }
 
-const refreshUI = () => { renderTable(); renderInactive(); renderStats(); };
+// 状态写入很密集（扫描时几十次），合并成一次渲染
+let _refreshTimer = null;
+const refreshUI = () => {
+    if (_refreshTimer) return;
+    _refreshTimer = setTimeout(() => {
+        _refreshTimer = null;
+        renderTable(); renderInactive(); renderStats();
+    }, 120);
+};
 
 const spinCellHtml = (nextTs, lastReward, label = '🎡 Spin') => {
     const last = escapeHtml(lastReward);
@@ -2969,6 +3001,8 @@ const yusceneCellHtml = () => {
     let pumpkinLine;
     if (GM_getValue(PUMPKIN_RETIRED_KEY, false) === true) {
         pumpkinLine = `<span style="color:#7a6a5a">🎃 南瓜：已下线（万圣节活动结束）</span>`;
+    } else if (pumpkinAttemptsToday() >= PUMPKIN_MAX_ATTEMPTS) {
+        pumpkinLine = `<span style="color:#ffb266">🎃 南瓜：今日已尝试 ${PUMPKIN_MAX_ATTEMPTS} 次未确认</span> · 明日再试`;
     } else if (pumpkinDone()) {
         const reward = GM_getValue(PUMPKIN_LAST_REWARD_KEY, '');
         pumpkinLine = `<span style="color:#9ccc65">🎃 南瓜：已领</span>${reward ? ` · 上次 ${escapeHtml(reward)}` : ''}`;
@@ -3038,6 +3072,16 @@ function actionHtmlFor(host, st, isPromoted) {
     return html;
 }
 
+/** 站点表格行（活跃表 / 已停止表共用） */
+function rowHtml({ host, tag = '', failBadge = '', note = '', sub = '', cls, statusText, msg, actions }) {
+    return `<tr>`
+        + `<td><div class="host">${siteIconHtml(host)}<div class="host-body"><div class="host-name">${escapeHtml(host)}${tag}${failBadge}</div>${note}${sub}</div></div></td>`
+        + `<td class="${cls}">${statusText}</td>`
+        + `<td class="msg">${msg}</td>`
+        + `<td>${actions}</td>`
+        + `</tr>`;
+}
+
 function renderTable() {
     const tbody = document.getElementById('pt-tbody');
     if (!tbody) return;
@@ -3064,12 +3108,11 @@ function renderTable() {
         const failCount = getFailureCount(host);
         const failBadge = (failCount > 0 && failCount < AUTO_SCAN_CFG.failureThreshold)
             ? `<span class="fail-badge" title="连续失败次数">⚠ ${failCount}/${AUTO_SCAN_CFG.failureThreshold}</span>` : '';
-        return `<tr>`
-            + `<td><div class="host">${siteIconHtml(host)}<div class="host-body"><div class="host-name">${escapeHtml(host)}${tag}${failBadge}</div>${note}</div></div></td>`
-            + `<td class="st-${st.status}">${label}</td>`
-            + `<td class="msg">${msg}</td>`
-            + `<td>${actionHtmlFor(host, st, isPromoted)}</td>`
-            + `</tr>`;
+        return rowHtml({
+            host, tag, failBadge, note,
+            cls: `st-${st.status}`, statusText: label, msg,
+            actions: actionHtmlFor(host, st, isPromoted),
+        });
     }).join('');
 }
 
@@ -3098,19 +3141,20 @@ function renderInactive() {
         const cfg = inactiveMap[host];
         const st = getSiteStatus(host);
         const isAutoDemoted = !!cfg.autoDemoted;
-        const msg = st.message ? escapeHtml(st.message) : (cfg.reason ? escapeHtml(cfg.reason) : '<span class="msg empty">—</span>');
-        const tag = isAutoDemoted ? `<span class="demoted-tag">自动降级</span>` : '';
+        const isPaused = !!cfg.paused;
+        const msg = (isPaused || !st.message) ? (cfg.reason ? escapeHtml(cfg.reason) : '<span class="msg empty">—</span>') : escapeHtml(st.message);
+        const tag = isPaused ? `<span class="demoted-tag">维护暂停</span>`
+                  : isAutoDemoted ? `<span class="demoted-tag">自动降级</span>` : '';
         const failCount = getFailureCount(host);
         const failBadge = (isAutoDemoted && failCount > 0) ? `<span class="fail-badge">${failCount} 次失败</span>` : '';
         const actions = isAutoDemoted
             ? `<a href="https://${host}/" target="_blank">打开</a> · <a href="#" data-check="${host}">检测</a> · <a href="#" data-restore="${host}">恢复</a>`
             : `<a href="https://${host}/" target="_blank">打开</a> · <a href="#" data-check="${host}">检测</a>`;
-        return `<tr>`
-            + `<td><div class="host">${siteIconHtml(host)}<div class="host-body"><div class="host-name">${escapeHtml(host)}${tag}${failBadge}</div><div style="margin-top:4px">${computeScanBadge(st)}</div></div></div></td>`
-            + `<td class="st-inactive">💤 无活动</td>`
-            + `<td class="msg">${msg}</td>`
-            + `<td>${actions}</td>`
-            + `</tr>`;
+        return rowHtml({
+            host, tag, failBadge,
+            sub: `<div style="margin-top:4px">${computeScanBadge(st)}</div>`,
+            cls: 'st-inactive', statusText: isPaused ? '🛠 维护中' : '💤 无活动', msg, actions,
+        });
     }).join('');
     const promotedCount = getPromoted().length, demotedCount = getAutoDemoted().length;
     const badges = [];
@@ -3151,6 +3195,8 @@ function renderStats() {
         const pumpkinRetired = GM_getValue(PUMPKIN_RETIRED_KEY, false) === true;
         parts.push(pumpkinRetired
                    ? ' · <span style="color:#7a6a5a">南瓜: 已下线</span>'
+                   : pumpkinAttemptsToday() >= PUMPKIN_MAX_ATTEMPTS
+                   ? ` · <span style="color:#ffb266">南瓜: 今日已试 ${PUMPKIN_MAX_ATTEMPTS} 次</span>`
                    : pumpkinDone()
                    ? ' · <span style="color:#9ccc65">南瓜: 已领</span>'
                    : ` · <span style="color:#ffb266">南瓜: ${STATUS_LABELS[pumpkinSt.status] || pumpkinSt.status}</span>`);
@@ -3232,15 +3278,17 @@ function registerPanelEntry() {
 const NAVIGATE_TIMEOUT = 30 * 1000;
 const _navWatchdogs = new Map();
 function armNavigateWatchdog(host, timeout = NAVIGATE_TIMEOUT) {
-    // 优化：动态超时
+    // 慢站给更长的跳转宽限
     if (host === 'jme-reunit3d.de' || host === 'filelist.io') timeout = 45000;
-
     if (_navWatchdogs.has(host)) {
         clearTimeout(_navWatchdogs.get(host));
         _navWatchdogs.delete(host);
     }
     const startTs = Date.now();
+    // DOM 就绪说明已经跳过来了，提前撤销；once 避免监听器堆积
+    const onLoad = () => { clearTimeout(timer); _navWatchdogs.delete(host); };
     const timer = setTimeout(() => {
+        window.removeEventListener('DOMContentLoaded', onLoad);
         _navWatchdogs.delete(host);
         const st = getSiteStatus(host);
         if (st.status === 'claiming' && (st.ts || 0) <= startTs) {
@@ -3251,10 +3299,7 @@ function armNavigateWatchdog(host, timeout = NAVIGATE_TIMEOUT) {
         }
     }, timeout);
     _navWatchdogs.set(host, timer);
-
-    // 监听 DOM 加载，如果页面结构加载完毕，提前清空看门狗
-    const onLoad = () => { clearTimeout(timer); window.removeEventListener('DOMContentLoaded', onLoad); };
-    window.addEventListener('DOMContentLoaded', onLoad);
+    window.addEventListener('DOMContentLoaded', onLoad, { once: true });
 }
 
 function finishClaim(result) {
@@ -3341,6 +3386,7 @@ async function main() {
     log(`[Main] enter host=${HOST} hash=${location.hash} vis=${document.visibilityState}`);
     if (HOST === 'samaritano.cc' || GM_getValue(DEBUG_NETLOG_KEY, false)) PTLog.installNetworkLog(W);
     checkDailyReset();
+    migrateRenamedSites();
     cleanupStalePending();
     maybeClearStaleLock();
     startSpinTimers();
@@ -3355,23 +3401,16 @@ async function main() {
         markAutoTab();
         return runClaim();
     }
-    if (HOST === '0dayfiles.net') {
-        if (location.pathname === '/attendance' || location.pathname === '/spin-wheel') {
+    // 这几个站点在普通页面直接出面板，不做导航
+    if (HOST === '0dayfiles.net' || HOST === 'dirtybytes.net' || HOST === 'yu-scene.net') {
+        if (HOST === '0dayfiles.net' && (location.pathname === '/attendance' || location.pathname === '/spin-wheel')) {
             setSiteStatus(HOST, location.pathname === '/attendance'
                 ? await claimOn0DayFilesAttendance()
                 : await claimOn0DayFilesSpinWheel());
         }
+        if (HOST === 'dirtybytes.net') setSiteStatus(HOST, await claimOnDirtyBytes());
         renderDashboard();
-        return registerPanelEntry();
-    }
-    if (HOST === 'dirtybytes.net') {
-        setSiteStatus(HOST, await claimOnDirtyBytes());
-        renderDashboard();
-        return registerPanelEntry();
-    }
-    if (HOST === 'yu-scene.net') {
-        renderDashboard();
-        if (location.pathname === '/' || location.pathname === '') setupYuscenePumpkin();
+        if (HOST === 'yu-scene.net' && (location.pathname === '/' || location.pathname === '')) setupYuscenePumpkin();
         return registerPanelEntry();
     }
     const cfg = ALL_KNOWN_SITES[HOST];
@@ -3395,8 +3434,7 @@ async function main() {
         setSiteStatus(HOST, { status: 'claimed', message: extractRetroToonReward() || '已成功领取每日奖励' });
         return closeSelf();
     }
-    if (HOST === 'czteam.me') return runClaim();
-    if (cfg && cfg.handler === 'seedcore') return runClaim();
+    if (HOST === 'czteam.me' || (cfg && cfg.handler === 'seedcore')) return runClaim();
     if (!isOnEventPage()) maybeAutoScan();
     renderDashboard();
     registerPanelEntry();
