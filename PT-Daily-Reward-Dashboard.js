@@ -46,7 +46,7 @@
 // @match        https://immortuos.life/*
 // @match        https://capybarabr.com/*
 // @match        https://torrentland.li/*
-// @match        https://emuwarez.com/*
+// @match        https://emu-warez.com/*
 // @match        https://torrenteros.org/*
 // @match        https://tracker.milnueve.cc/*
 // @match        https://portugas.org/*
