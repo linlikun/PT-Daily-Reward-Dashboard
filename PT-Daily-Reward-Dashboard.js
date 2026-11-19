@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PT Daily Reward Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      11.0.1
+// @version      11.0.2
 // @description  多站点 PT 每日奖励控制面板；支持同站点多活动连续领取；极速后台静默领取；多特殊转盘支持；修复 seedpool 隐藏报错及误报成功；新增 polishtorrent/myfunzone/yu-scene 的 /events + 特殊玩法双分支；集成 V11 优化：防风控重试、CDN 兜底、悬浮球 Badge、后台静默、单站日志与插件化重构
 // @author       Whale, DeepSeek
 // @license      GPL-3.0 License
@@ -1049,29 +1049,44 @@ async function probeSpecialSiteHealth(host) {
 
 // 优化：将站点探测逻辑插件化
 const SITE_PROBES = {
+
     'v3x.club': async () => {
         try {
             let isClaimed = false;
             let messages = [];
 
-            // 第一步：签到
+            // 第一步：签到 API
             const dailyRes = await robustFetch('https://api.v3x.club/me/daily/claim-login', {
                 method: 'POST',
                 credentials: 'include',
                 headers: { 'Accept': '*/*', 'Origin': 'https://v3x.club', 'Referer': 'https://v3x.club/' }
             });
+
             if (dailyRes.status === 401 || dailyRes.status === 403) return { status: 'auth', message: '需要登录' };
 
             if (dailyRes.status === 200 || dailyRes.status === 204) {
-                messages.push('签到成功');
+                let dailyRewardStr = '';
+                try {
+                    const text = await dailyRes.text();
+                    if (text && text.trim()) {
+                        const json = JSON.parse(text);
+                        // 兼容多种可能的 JSON 字段名
+                        const reward = json.reward || json.points || json.amount || json.value;
+                        if (reward !== undefined && reward !== null) {
+                            dailyRewardStr = `签到：+${reward}`;
+                        }
+                    }
+                } catch (e) {}
+
+                messages.push(dailyRewardStr || '签到：成功');
                 isClaimed = true;
             } else if (dailyRes.status === 400 || dailyRes.status === 409) {
-                messages.push('签到已领');
+                messages.push('签到：今日已领');
             } else {
                 messages.push(`签到异常(${dailyRes.status})`);
             }
 
-            // 第二步：转盘
+            // 第二步：转盘 API
             const wheelRes = await robustFetch('https://api.v3x.club/me/wheel/spin', {
                 method: 'POST',
                 credentials: 'include',
@@ -1079,15 +1094,30 @@ const SITE_PROBES = {
             });
 
             if (wheelRes.status === 200) {
-                const wheelData = await wheelRes.json();
-                if (wheelData.ok) {
-                    messages.push(`转盘+${wheelData.reward}`);
+                let wheelRewardStr = '';
+                try {
+                    const text = await wheelRes.text();
+                    if (text && text.trim()) {
+                        const json = JSON.parse(text);
+                        if (json.ok) {
+                            const reward = json.reward || json.points || json.amount || json.value;
+                            if (reward !== undefined && reward !== null) {
+                                wheelRewardStr = `转盘：+${reward}`;
+                            } else {
+                                wheelRewardStr = `转盘：${json.label || '成功'}`;
+                            }
+                        }
+                    }
+                } catch (e) {}
+
+                if (wheelRewardStr) {
+                    messages.push(wheelRewardStr);
                     isClaimed = true;
                 } else {
-                    messages.push('转盘已转');
+                    messages.push('转盘：已转');
                 }
             } else if (wheelRes.status === 400 || wheelRes.status === 409) {
-                messages.push('转盘已转');
+                messages.push('转盘：今日已转');
             } else {
                 messages.push(`转盘异常(${wheelRes.status})`);
             }
