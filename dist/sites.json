@@ -31,7 +31,6 @@
   "filelist.io":             { "handler": "filelist", "rewardPath": "/spin.php" },
   "torrenthaven.org":        { "handler": "unit3d", "rewardPath": "/events", "rewardLinkText": ["Daily Reward", "FreeLeech Tokens", "Try To Win", "Claim"] },
   "nordicq.org":             { "handler": "unit3d", "rewardPath": "/events" },
-  
   "onlyencodes.cc":          { "handler": "unit3d" },
   "itatorrents.xyz":         { "handler": "unit3d" },
   "immortuos.life":          { "handler": "unit3d" },
