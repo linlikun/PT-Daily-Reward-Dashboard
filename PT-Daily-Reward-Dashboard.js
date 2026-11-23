@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         PT Daily Reward Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      11.0.5
-// @description  多站点 PT 每日奖励控制面板；支持同站点多活动连续领取；极速后台静默领取；多特殊转盘支持；修复 seedpool 隐藏报错及误报成功；新增 polishtorrent/myfunzone/yu-scene 的 /events + 特殊玩法双分支；集成 V11 优化：防风控重试、CDN 兜底、悬浮球 Badge、后台静默、单站日志与插件化重构
+// @version      11.0.6
+// @description  多站点 PT 每日奖励控制面板；支持同站点多活动连续领取；极速后台静默领取；多特殊转盘支持；修复 seedpool 隐藏报错及误报成功；新增 polishtorrent/myfunzone/yu-scene 的 /events + 特殊玩法双分支；集成 V11 优化：防风控重试、CDN 兜底、悬浮球 Badge、后台静默、单站日志与插件化重构；torrenthaven.org 已并入 infinityhd.net，移除该旧域名
 // @author       Whale, DeepSeek
 // @license      GPL-3.0 License
 // @match        https://bitporn.eu/*
@@ -65,7 +65,6 @@
 // @match        https://3dvault.org/*
 // @match        https://f1carreras.xyz/*
 // @match        https://filelist.io/*
-// @match        https://torrenthaven.org/*
 // @match        https://v3x.club/*
 // @icon         https://cdn.jsdelivr.net/gh/twitter/twemoji@master/assets/svg/1f381.svg
 // @resource     pt_css        https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/dashboard.css
@@ -181,6 +180,8 @@ const SITE_OVERRIDES = {
     // emuwarez 2026-11 换域名：旧域名下线，新域名沿用 unit3d 的 /events
     'emuwarez.com': null,
     'emu-warez.com': { handler: 'unit3d', rewardPath: '/events' },
+    // torrenthaven.org 2026-11 已合并入 infinityhd.net：旧域名不再探测，也不出现在活跃/已停止表
+    'torrenthaven.org': null,
 };
 // 维护中站点：until 之前完全不探测（不占扫描时间、不计失败），到期自动回到常规探测
 const SITE_PAUSED = {
@@ -569,7 +570,8 @@ const demoteSite = host => setPromoted(getPromoted().filter(h => h !== host));
 const getPausedSites = () => Object.keys(SITE_PAUSED).filter(h => (SITE_PAUSED[h].until || 0) > Date.now());
 /** 旧域名下线后清掉它的状态/失败计数/降级记录，避免面板里留幽灵条目（只跑一次） */
 function migrateRenamedSites() {
-    const flag = 'pt_migrate_v1105';
+    // v11.0.6：清理已并入 infinityhd.net 的 torrenthaven.org 遗留状态，避免面板里继续出现
+    const flag = 'pt_migrate_v1106';
     if (GM_getValue(flag, false) === true) return;
     for (const oldH of Object.keys(SITE_OVERRIDES)) {
         if (SITE_OVERRIDES[oldH] !== null) continue;
