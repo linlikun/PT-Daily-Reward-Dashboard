@@ -5,11 +5,11 @@
 
 > 多站点 PT 每日奖励控制面板 —— 一个 Tampermonkey 用户脚本，把几十个 PT 站的每日签到、转盘、活动礼物收进同一个面板里批量领取。
 
-![version](https://img.shields.io/badge/version-11.0.5-blue)
+![version](https://img.shields.io/badge/version-11.0.6-blue)
 ![license](https://img.shields.io/badge/license-GPL--3.0-green)
 ![platform](https://img.shields.io/badge/platform-Tampermonkey-orange)
 
-支持 **58 个站点**，覆盖 Unit3D 系活动页、以及十余个有独立玩法的站点（转盘、签到、南瓜、抽奖）。所有领取都在后台静默完成，不抢焦点、不打断你正在做的事。
+支持 **57 个站点**，覆盖 Unit3D 系活动页、以及十余个有独立玩法的站点（转盘、签到、南瓜、抽奖）。所有领取都在后台静默完成，不抢焦点、不打断你正在做的事。
 
 ---
 
@@ -93,12 +93,13 @@ Tampermonkey 菜单里还有几个排查用的开关：
 
 ## 支持的站点
 
-按处理器分为 12 类，共 58 个站点：
+按处理器分为 13 类，共 57 个站点：
 
 | 处理器 | 站点数 | 说明 |
 |---|---|---|
-| `unit3d` | 47 | Unit3D 系标准活动页（`/events`） |
+| `unit3d` | 45 | Unit3D 系标准活动页（`/events`） |
 | `infinityhd` | 1 | InfinityHD 定制活动页 |
+| `v3x` | 1 | V3X：签到 + 转盘直接调用 `api.v3x.club` |
 | `digitalcore` | 1 | DigitalCore 积分签到 |
 | `dirtybytes` | 1 | DirtyBytes 每日连续签到 |
 | `czteam` | 1 | CZTeam 每日礼物 |
@@ -113,11 +114,11 @@ Tampermonkey 菜单里还有几个排查用的开关：
 <details>
 <summary>展开完整站点列表</summary>
 
-**Unit3D 系（47）**
-3dvault.org · bitporn.eu · capybarabr.com · clearjav.com · darkpeers.org · dreadvault.org · eiga.moi · emu-warez.com · f1carreras.xyz · gemini-tracker.org · generation-free.org · hd-united.vn · hellenic-hd.cc · homiehelpdesk.net · immortuos.life · itatorrents.xyz · jme-reunit3d.de · lat-team.com · luminarr.me · malayabits.cc · midnightscene.cc · nirvana.li · nordicq.org · oldtoons.world · onlyencodes.cc · podzemlje.net · portugas.org · rastastugan.org · reelflix.cc · retro-movies.club · samaritano.cc · seedpool.org · sextorrent.myds.me · shareisland.org · skipthecommercials.xyz · torrent.desi · torrenteros.org · torrenthaven.org · torrentland.li · tracker.milnueve.cc · tracker.teamflix.cc · tracker.vietmediaf.store · turkseed.com · upload.cx · upscalevault.com · v3x.club · znth.cx
+**Unit3D 系（45）**
+3dvault.org · bitporn.eu · capybarabr.com · clearjav.com · darkpeers.org · dreadvault.org · eiga.moi · emu-warez.com · f1carreras.xyz · gemini-tracker.org · generation-free.org · hd-united.vn · hellenic-hd.cc · homiehelpdesk.net · immortuos.life · itatorrents.xyz · jme-reunit3d.de · lat-team.com · luminarr.me · malayabits.cc · midnightscene.cc · nirvana.li · nordicq.org · oldtoons.world · onlyencodes.cc · podzemlje.net · portugas.org · rastastugan.org · reelflix.cc · retro-movies.club · samaritano.cc · seedpool.org · sextorrent.myds.me · shareisland.org · skipthecommercials.xyz · torrent.desi · torrenteros.org · torrentland.li · tracker.milnueve.cc · tracker.teamflix.cc · tracker.vietmediaf.store · turkseed.com · upload.cx · upscalevault.com · znth.cx
 
-**独立玩法（11）**
-0dayfiles.net · czteam.me · digitalcore.club · dirtybytes.net · filelist.io · infinityhd.net · myfunzone.org · polishtorrent.top · retrotoon.world · seedcore.net · yu-scene.net
+**独立玩法（12）**
+0dayfiles.net · czteam.me · digitalcore.club · dirtybytes.net · filelist.io · infinityhd.net · myfunzone.org · polishtorrent.top · retrotoon.world · seedcore.net · v3x.club · yu-scene.net
 
 </details>
 
@@ -222,6 +223,10 @@ const SITE_PAUSED = {
 菜单里的「🌐 切换网络日志 hook」会把站点自身请求也记进来，排查完记得关掉，否则日志会被站点自身的轮询刷满。
 
 ## 更新日志
+
+### 11.0.6
+- `torrenthaven.org` 已并入 `infinityhd.net`：从活跃站点表、脚本匹配规则和本地缓存中移除
+- `v3x.club` 改为独立 `v3x` handler：签到与转盘直接 POST `api.v3x.club`，不再跳转不存在的 `/events` 页面
 
 ### 11.0.5
 - 支持站点改名（`emu-warez.com`），旧域名记录自动清理

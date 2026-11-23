@@ -2,7 +2,7 @@
 // @name         PT Daily Reward Dashboard
 // @namespace    http://tampermonkey.net/
 // @version      11.0.6
-// @description  多站点 PT 每日奖励控制面板；支持同站点多活动连续领取；极速后台静默领取；多特殊转盘支持；修复 seedpool 隐藏报错及误报成功；新增 polishtorrent/myfunzone/yu-scene 的 /events + 特殊玩法双分支；集成 V11 优化：防风控重试、CDN 兜底、悬浮球 Badge、后台静默、单站日志与插件化重构；torrenthaven.org 已并入 infinityhd.net，移除该旧域名
+// @description  多站点 PT 每日奖励控制面板；支持同站点多活动连续领取；极速后台静默领取；多特殊转盘支持；修复 seedpool 隐藏报错及误报成功；新增 polishtorrent/myfunzone/yu-scene 的 /events + 特殊玩法双分支；集成 V11 优化：防风控重试、CDN 兜底、悬浮球 Badge、后台静默、单站日志与插件化重构；torrenthaven.org 已并入 infinityhd.net，移除该旧域名；v3x.club 改用独立 API handler，签到与转盘直接请求 api.v3x.club，不再跳转 /events
 // @author       Whale, DeepSeek
 // @license      GPL-3.0 License
 // @match        https://bitporn.eu/*
@@ -182,6 +182,8 @@ const SITE_OVERRIDES = {
     'emu-warez.com': { handler: 'unit3d', rewardPath: '/events' },
     // torrenthaven.org 2026-11 已合并入 infinityhd.net：旧域名不再探测，也不出现在活跃/已停止表
     'torrenthaven.org': null,
+    // v3x.club 没有 /events：签到与转盘走独立 API handler，避免 CDN 旧配置把它带回 unit3d
+    'v3x.club': { handler: 'v3x' },
 };
 // 维护中站点：until 之前完全不探测（不占扫描时间、不计失败），到期自动回到常规探测
 const SITE_PAUSED = {
@@ -1267,6 +1269,8 @@ async function v3xProbe() {
         return { status: claimed ? 'claimed' : 'already', message: msgs.join('，') };
     } catch (e) { return { status: 'failed', message: `异常：${e.message}` }; }
 }
+// v3x 的「探针」与「领取」是同一件事：直接 POST 两个 API，不需要开 tab / 访问 /events
+const claimOnV3x = guardLogin(v3xProbe);
 
 /** filelist 冷却文本 → 下次可转时间戳（探针与领取共用） */
 function filelistCooldownTs(text) {
@@ -2382,6 +2386,7 @@ const claimOnPolishTorrentWheel = guardLogin(async () => {
 
 // 优化：将站点领取逻辑插件化
 const SITE_HANDLERS = {
+    v3x: claimOnV3x,
     czteam: claimOnCzTeam,
     seedcore: claimOnSeedCore,
     retrotoon: claimOnRetroToon,
