@@ -5,7 +5,7 @@
 
 > 多站点 PT 每日奖励控制面板 —— 一个 Tampermonkey 用户脚本，把几十个 PT 站的每日签到、转盘、活动礼物收进同一个面板里批量领取。
 
-![version](https://img.shields.io/badge/version-11.0.7-blue)
+![version](https://img.shields.io/badge/version-11.0.8-blue)
 ![license](https://img.shields.io/badge/license-GPL--3.0-green)
 ![platform](https://img.shields.io/badge/platform-Tampermonkey-orange)
 
@@ -187,7 +187,7 @@ const SITE_OVERRIDES = {
 
 ```js
 const SITE_PAUSED = {
-    'oldtoons.world': { reason: '站点维护中', until: Date.parse('2026-11-26T00:00:00+08:00') },
+    'example.org': { reason: '站点维护中', until: Date.parse('2026-11-30T00:00:00+08:00') },
 };
 ```
 
@@ -223,6 +223,9 @@ const SITE_PAUSED = {
 菜单里的「🌐 切换网络日志 hook」会把站点自身请求也记进来，排查完记得关掉，否则日志会被站点自身的轮询刷满。
 
 ## 更新日志
+
+### 11.0.8
+- `oldtoons.world` 已恢复正常：移除维护暂停，恢复常规扫描与自动领取；一次性清除暂停期间留下的旧状态并触发立即重扫，避免被 12 小时状态缓存或 1 小时自动扫描间隔挡住
 
 ### 11.0.7
 - CDN 资源链接加版本号（`?v=11.0.7`），绕过 jsDelivr 对 `@main` 分支的 12 小时缓存，更新脚本即可立刻拿到最新资源

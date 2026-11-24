@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         PT Daily Reward Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      11.0.7
-// @description  多站点 PT 每日奖励控制面板；支持同站点多活动连续领取；极速后台静默领取；多特殊转盘支持；修复 seedpool 隐藏报错及误报成功；新增 polishtorrent/myfunzone/yu-scene 的 /events + 特殊玩法双分支；集成 V11 优化：防风控重试、CDN 兜底、悬浮球 Badge、后台静默、单站日志与插件化重构；torrenthaven.org 已并入 infinityhd.net，移除该旧域名；v3x.club 改用独立 API handler，签到与转盘直接请求 api.v3x.club，不再跳转 /events；CDN 资源链接加版本号绕过 jsDelivr 分支缓存
+// @version      11.0.8
+// @description  多站点 PT 每日奖励控制面板；支持同站点多活动连续领取；极速后台静默领取；多特殊转盘支持；修复 seedpool 隐藏报错及误报成功；新增 polishtorrent/myfunzone/yu-scene 的 /events + 特殊玩法双分支；集成 V11 优化：防风控重试、CDN 兜底、悬浮球 Badge、后台静默、单站日志与插件化重构；torrenthaven.org 已并入 infinityhd.net，移除该旧域名；v3x.club 改用独立 API handler，签到与转盘直接请求 api.v3x.club，不再跳转 /events；CDN 资源链接加版本号绕过 jsDelivr 分支缓存；oldtoons.world 已恢复，移除维护暂停并清除遗留状态
 // @author       Whale, DeepSeek
 // @license      GPL-3.0 License
 // @match        https://bitporn.eu/*
@@ -67,11 +67,11 @@
 // @match        https://filelist.io/*
 // @match        https://v3x.club/*
 // @icon         https://cdn.jsdelivr.net/gh/twitter/twemoji@master/assets/svg/1f381.svg
-// @resource     pt_css        https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/dashboard.css?v=11.0.7
-// @resource     pt_html       https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/dashboard.html?v=11.0.7
-// @resource     pt_sites      https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/sites.json?v=11.0.7
-// @resource     pt_inactive   https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/inactive.json?v=11.0.7
-// @resource     pt_timezone   https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/timezone.json?v=11.0.7
+// @resource     pt_css        https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/dashboard.css?v=11.0.8
+// @resource     pt_html       https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/dashboard.html?v=11.0.8
+// @resource     pt_sites      https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/sites.json?v=11.0.8
+// @resource     pt_inactive   https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/inactive.json?v=11.0.8
+// @resource     pt_timezone   https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/timezone.json?v=11.0.8
 // @grant        GM_getResourceText
 // @grant        GM_openInTab
 // @grant        GM_setValue
@@ -83,7 +83,7 @@
 // @grant        GM_xmlhttpRequest
 // @grant        window.close
 // @grant        unsafeWindow
-// @require      https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/pt-core.js?v=11.0.7
+// @require      https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/pt-core.js?v=11.0.8
 // @run-at       document-idle
 // @noframes
 // @connect      *
@@ -186,9 +186,8 @@ const SITE_OVERRIDES = {
     'v3x.club': { handler: 'v3x' },
 };
 // 维护中站点：until 之前完全不探测（不占扫描时间、不计失败），到期自动回到常规探测
-const SITE_PAUSED = {
-    'oldtoons.world': { reason: '站点维护中（修复 PHP 漏洞）', until: Date.parse('2026-11-26T00:00:00+08:00') },
-};
+// oldtoons.world 2026-11-24 已恢复正常（活动页可领取），移除维护暂停并恢复常规扫描
+const SITE_PAUSED = {};
 const SITES_RAW       = resJson('pt_sites', {});
 const SITES           = (() => {
     const out = { ...SITES_RAW };
@@ -584,6 +583,24 @@ function migrateRenamedSites() {
         removeFromDemoted(oldH);
         log(`[Migrate] 旧域名 ${oldH} 的本地记录已清理`);
     }
+    GM_setValue(flag, true);
+}
+
+/** 维护恢复的站点：清掉暂停期间留下的状态/失败计数/降级记录，让下一次扫描立刻重新探测 */
+function migrateResumedSites() {
+    // v11.0.8：oldtoons.world 已恢复，清除维护暂停期间的旧状态（否则 12 小时内会被当作已探测跳过）
+    const flag = 'pt_migrate_v1108';
+    if (GM_getValue(flag, false) === true) return;
+    for (const host of ['oldtoons.world']) {
+        GM_deleteValue(keyFor(host));
+        GM_deleteValue(FAILURE_KEY_PREFIX + host);
+        GM_deleteValue(EVENT_PATH_CACHE_PREFIX + host);
+        clearPendingEvents(host);
+        removeFromDemoted(host);
+        log(`[Migrate] ${host} 已恢复，清除暂停期间状态`);
+    }
+    // 让下次打开面板立即重新扫描（否则会被 1 小时自动扫描间隔挡住，恢复的站点要等很久才被探测）
+    GM_setValue(AUTO_SCAN_TIME_KEY, 0);
     GM_setValue(flag, true);
 }
 
@@ -3394,6 +3411,7 @@ async function main() {
     if (HOST === 'samaritano.cc' || GM_getValue(DEBUG_NETLOG_KEY, false)) PTLog.installNetworkLog(W);
     checkDailyReset();
     migrateRenamedSites();
+    migrateResumedSites();
     cleanupStalePending();
     maybeClearStaleLock();
     startSpinTimers();
