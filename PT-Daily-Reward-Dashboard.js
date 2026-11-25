@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         PT Daily Reward Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      11.0.8
-// @description  多站点 PT 每日奖励控制面板；支持同站点多活动连续领取；极速后台静默领取；多特殊转盘支持；修复 seedpool 隐藏报错及误报成功；新增 polishtorrent/myfunzone/yu-scene 的 /events + 特殊玩法双分支；集成 V11 优化：防风控重试、CDN 兜底、悬浮球 Badge、后台静默、单站日志与插件化重构；torrenthaven.org 已并入 infinityhd.net，移除该旧域名；v3x.club 改用独立 API handler，签到与转盘直接请求 api.v3x.club，不再跳转 /events；CDN 资源链接加版本号绕过 jsDelivr 分支缓存；oldtoons.world 已恢复，移除维护暂停并清除遗留状态
+// @version      11.0.9
+// @description  多站点 PT 每日奖励控制面板；支持同站点多活动连续领取；极速后台静默领取；多特殊转盘支持；修复 seedpool 隐藏报错及误报成功；新增 polishtorrent/myfunzone/yu-scene 的 /events + 特殊玩法双分支；集成 V11 优化：防风控重试、CDN 兜底、悬浮球 Badge、后台静默、单站日志与插件化重构；torrenthaven.org 已并入 infinityhd.net，移除该旧域名；v3x.club 改用独立 API handler，签到与转盘直接请求 api.v3x.club，不再跳转 /events；CDN 资源链接加版本号绕过 jsDelivr 分支缓存；oldtoons.world 已恢复，移除维护暂停并清除遗留状态；修复用户手动打开 seedcore/czteam 首页被自动领取并关闭标签页的问题，领取与自动关闭仅限脚本打开的标签
 // @author       Whale, DeepSeek
 // @license      GPL-3.0 License
 // @match        https://bitporn.eu/*
@@ -67,11 +67,11 @@
 // @match        https://filelist.io/*
 // @match        https://v3x.club/*
 // @icon         https://cdn.jsdelivr.net/gh/twitter/twemoji@master/assets/svg/1f381.svg
-// @resource     pt_css        https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/dashboard.css?v=11.0.8
-// @resource     pt_html       https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/dashboard.html?v=11.0.8
-// @resource     pt_sites      https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/sites.json?v=11.0.8
-// @resource     pt_inactive   https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/inactive.json?v=11.0.8
-// @resource     pt_timezone   https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/timezone.json?v=11.0.8
+// @resource     pt_css        https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/dashboard.css?v=11.0.9
+// @resource     pt_html       https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/dashboard.html?v=11.0.9
+// @resource     pt_sites      https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/sites.json?v=11.0.9
+// @resource     pt_inactive   https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/inactive.json?v=11.0.9
+// @resource     pt_timezone   https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/timezone.json?v=11.0.9
 // @grant        GM_getResourceText
 // @grant        GM_openInTab
 // @grant        GM_setValue
@@ -83,7 +83,7 @@
 // @grant        GM_xmlhttpRequest
 // @grant        window.close
 // @grant        unsafeWindow
-// @require      https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/pt-core.js?v=11.0.8
+// @require      https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/pt-core.js?v=11.0.9
 // @run-at       document-idle
 // @noframes
 // @connect      *
@@ -215,6 +215,13 @@ const DIRTYBYTES_ORIGIN = 'https://dirtybytes.net';
 const DIRTYBYTES_API = '/api/v1/status?timeSinceLastCheck=10011';
 const CLAIM_HASH = '#pt-claim', DETECT_HASH = '#pt-detect',
       DASHBOARD_HASH = '#pt-dashboard', PUMPKIN_HASH = '#pt-pumpkin';
+
+// 页面初次加载时 URL 携带的 hash。脚本用 GM_openInTab 打开的领取/检测标签一定带
+// #pt-claim / #pt-detect / #pt-pumpkin；用户手动打开站点首页则没有。
+// 只能用初加载的 hash 判定“脚本打开的标签”——领取过程中的内部跳转（如 seedcore
+// 跳到 /events/2#pt-claim）会让用户手动打开的页面事后带上 hash，不能据此误标。
+const BOOT_HASH = location.hash;
+const isScriptOpenedTab = () => BOOT_HASH === CLAIM_HASH || BOOT_HASH === DETECT_HASH || BOOT_HASH === PUMPKIN_HASH;
 
 const TTL_SNAPSHOT = 10 * MIN, TTL_EVENT_PATH = 6 * HOUR, TTL_DC_POINTS = 24 * HOUR,
       TTL_AUTO_SCAN_MIN = HOUR, TTL_RECHECK = 12 * HOUR,
@@ -675,6 +682,10 @@ window.addEventListener('beforeunload', () => {
 });
 
 const markAutoTab = () => {
+    // 只标记脚本自己用 GM_openInTab 打开的标签（初加载即带领取/检测 hash）。
+    // 用户手动打开的页面即使领取过程中被内部跳转加上 hash，也不能标记为自动标签，
+    // 否则 closeSelf() 会把用户正在看的页面关掉。
+    if (!isScriptOpenedTab()) return;
     try { sessionStorage.setItem(AUTO_TAB_SESSION_KEY, JSON.stringify({ ts: Date.now(), from: location.hash || 'unknown' })); } catch (e) {}
 };
 function isAutoOpenedTab() {
@@ -3459,7 +3470,9 @@ async function main() {
         setSiteStatus(HOST, { status: 'claimed', message: extractRetroToonReward() || '已成功领取每日奖励' });
         return closeSelf();
     }
-    if (HOST === 'czteam.me' || (cfg && cfg.handler === 'seedcore')) return runClaim();
+    // czteam / seedcore 只能在脚本打开的领取标签里直接领取。用户手动打开站点首页时
+    // 没有领取 hash，必须渲染面板交由用户控制，不能自动领取（否则还会被误关页面）。
+    if ((HOST === 'czteam.me' || (cfg && cfg.handler === 'seedcore')) && isScriptOpenedTab()) return runClaim();
     if (!isOnEventPage()) maybeAutoScan();
     renderDashboard();
     registerPanelEntry();

@@ -5,7 +5,7 @@
 
 > 多站点 PT 每日奖励控制面板 —— 一个 Tampermonkey 用户脚本，把几十个 PT 站的每日签到、转盘、活动礼物收进同一个面板里批量领取。
 
-![version](https://img.shields.io/badge/version-11.0.8-blue)
+![version](https://img.shields.io/badge/version-11.0.9-blue)
 ![license](https://img.shields.io/badge/license-GPL--3.0-green)
 ![platform](https://img.shields.io/badge/platform-Tampermonkey-orange)
 
@@ -223,6 +223,9 @@ const SITE_PAUSED = {
 菜单里的「🌐 切换网络日志 hook」会把站点自身请求也记进来，排查完记得关掉，否则日志会被站点自身的轮询刷满。
 
 ## 更新日志
+
+### 11.0.9
+- 修复用户手动打开 `seedcore.net` / `czteam.me` 首页时被自动领取并关闭标签页的问题：领取和自动关闭现在只对脚本自己打开的标签生效（以初次加载时的 `#pt-claim` / `#pt-detect` / `#pt-pumpkin` 标记为依据），用户浏览器打开的页面由用户控制
 
 ### 11.0.8
 - `oldtoons.world` 已恢复正常：移除维护暂停，恢复常规扫描与自动领取；一次性清除暂停期间留下的旧状态并触发立即重扫，避免被 12 小时状态缓存或 1 小时自动扫描间隔挡住
