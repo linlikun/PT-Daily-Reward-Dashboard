@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         PT Daily Reward Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      11.0.9
-// @description  多站点 PT 每日奖励控制面板；支持同站点多活动连续领取；极速后台静默领取；多特殊转盘支持；修复 seedpool 隐藏报错及误报成功；新增 polishtorrent/myfunzone/yu-scene 的 /events + 特殊玩法双分支；集成 V11 优化：防风控重试、CDN 兜底、悬浮球 Badge、后台静默、单站日志与插件化重构；torrenthaven.org 已并入 infinityhd.net，移除该旧域名；v3x.club 改用独立 API handler，签到与转盘直接请求 api.v3x.club，不再跳转 /events；CDN 资源链接加版本号绕过 jsDelivr 分支缓存；oldtoons.world 已恢复，移除维护暂停并清除遗留状态；修复用户手动打开 seedcore/czteam 首页被自动领取并关闭标签页的问题，领取与自动关闭仅限脚本打开的标签
+// @version      11.0.10
+// @description  多站点 PT 每日奖励控制面板；支持同站点多活动连续领取；极速后台静默领取；多特殊转盘支持；修复 seedpool 隐藏报错及误报成功；新增 polishtorrent/myfunzone/yu-scene 的 /events + 特殊玩法双分支；集成 V11 优化：防风控重试、CDN 兜底、悬浮球 Badge、后台静默、单站日志与插件化重构；torrenthaven.org 已并入 infinityhd.net，移除该旧域名；v3x.club 改用独立 API handler，签到与转盘直接请求 api.v3x.club，不再跳转 /events；CDN 资源链接加版本号绕过 jsDelivr 分支缓存；oldtoons.world 已恢复，移除维护暂停并清除遗留状态；修复用户手动打开 seedcore/czteam 首页被自动领取并关闭标签页的问题；强化多语言登录页/重定向识别，未登录站点统一归类 auth 并在扫描结束后汇总提醒；缩短探测重试退避并为领取中的站点加跨标签页忙碌锁，避免慢站点被陈旧状态清理打断
 // @author       Whale, DeepSeek
 // @license      GPL-3.0 License
 // @match        https://bitporn.eu/*
@@ -67,11 +67,11 @@
 // @match        https://filelist.io/*
 // @match        https://v3x.club/*
 // @icon         https://cdn.jsdelivr.net/gh/twitter/twemoji@master/assets/svg/1f381.svg
-// @resource     pt_css        https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/dashboard.css?v=11.0.9
-// @resource     pt_html       https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/dashboard.html?v=11.0.9
-// @resource     pt_sites      https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/sites.json?v=11.0.9
-// @resource     pt_inactive   https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/inactive.json?v=11.0.9
-// @resource     pt_timezone   https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/timezone.json?v=11.0.9
+// @resource     pt_css        https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/dashboard.css?v=11.0.10
+// @resource     pt_html       https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/dashboard.html?v=11.0.10
+// @resource     pt_sites      https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/sites.json?v=11.0.10
+// @resource     pt_inactive   https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/inactive.json?v=11.0.10
+// @resource     pt_timezone   https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/timezone.json?v=11.0.10
 // @grant        GM_getResourceText
 // @grant        GM_openInTab
 // @grant        GM_setValue
@@ -83,7 +83,7 @@
 // @grant        GM_xmlhttpRequest
 // @grant        window.close
 // @grant        unsafeWindow
-// @require      https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/pt-core.js?v=11.0.9
+// @require      https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/pt-core.js?v=11.0.10
 // @run-at       document-idle
 // @noframes
 // @connect      *
@@ -111,7 +111,7 @@ const {
     sleep, waitFor, escapeHtml, escOrDash, siteIconHtml, showToast,
     fmtAgo, fmtNext, fmtClock, remainMin, cooldownText,
     isNetError, fetchWithTimeout, gmFetch, getCsrfToken,
-    looksLikeLoginResponse, classifyHtml, httpStatusToResult,
+    looksLikeLoginPage, looksLikeLoginResponse, classifyHtml, httpStatusToResult,
     isMaintenancePage, isMaintenanceText, isMaintenanceBody, isOnLoginPageNow,
     tabRegistry, openTab, closeTab, spawnClaimTab,
 } = CORE;
@@ -293,6 +293,23 @@ const isNavigating = r => !!r && r.status === STATUS.NAVIGATING;
 const loginGate = () => (isOnLoginPageNow() ? authResult() : null);
 const guardLogin = fn => async (...a) => loginGate() || fn(...a);
 
+// 登录重定向 / 多语言登录页识别。
+// turkseed.com、podzemlje.net、tracker.vietmediaf.store 等站点的活动页在
+// 未登录时会 302 到 /login；部分站点的登录页标题是本地语言（如土耳其语
+// "Hesap Giriş - TURKSEED"），只看英文 title 会漏判，最终被误报为
+// "活动列表为空" 或一路等到探测预算耗尽。这里把 URL 与 HTML 两条路径都兜住。
+const LOGIN_PATH_RE = /\/(login|signin|sign-in|auth|giris|giriş)(?:\/|$|[?#])/i;
+const loginRedirected = res => {
+    if (!res) return false;
+    if (looksLikeLoginResponse(res)) return true;
+    try { return LOGIN_PATH_RE.test(new URL(res.finalUrl || res.url || '').pathname); }
+    catch (e) { return false; }
+};
+const looksLikeLoginHtml = html => !!html && (
+    looksLikeLoginPage(html) ||
+    /Hesap Giri[şs]|Giri[şs] Yap|Kullan[ıi]c[ıi] Ad[ıi]|re[şs]ifre/i.test(html)
+);
+
 // DirtyBytes 每日登录奖励：探针与领取共用一份解析。
 // 注意 pt-core 的 gmFetch 响应只有 text()，没有 json()，必须自己 JSON.parse。
 const DIRTYBYTES_STATUS = async () => {
@@ -357,6 +374,9 @@ async function robustFetch(url, opts = {}, timeout = 0, retries = 3) {
     // 兼容旧调用 robustFetch(url, opts, timeout, retries)：原先这两个位置参数被静默丢弃
     const maxRetries = Math.max(1, retries | 0);
     const base = timeout ? { ...opts, timeout } : opts;
+    // 探测阶段用 fastRetry：限速退避从 2s/4s 降到 ~0.6s/1.2s，
+    // 避免慢站点把 20s 探测预算全耗在 sleep 上。
+    const fast = !!base.fastRetry;
     for (let attempt = 1; ; attempt++) {
         try {
             const headers = { ...DEFAULT_HEADERS, ...(base.headers || {}) };
@@ -369,7 +389,9 @@ async function robustFetch(url, opts = {}, timeout = 0, retries = 3) {
             return res;
         } catch (e) {
             if (attempt >= maxRetries) throw e;
-            const delay = 2 ** attempt * 1000 + Math.random() * 500;
+            const delay = fast
+                ? attempt * 600 + Math.random() * 300
+                : 2 ** attempt * 1000 + Math.random() * 500;
             log(`[Fetch] ${url} 请求异常或限速，${delay.toFixed(0)}ms 后重试 (${attempt}/${maxRetries})...`);
             await sleep(delay);
         }
@@ -611,6 +633,24 @@ function migrateResumedSites() {
     GM_setValue(flag, true);
 }
 
+function migrateAuthDetection() {
+    // v11.0.10：这几个站点此前可能被误判为 inactive/timeout 并累积失败计数，
+    // 升级后清一次状态，让新的登录页识别逻辑立刻重新探测。
+    const flag = 'pt_migrate_v11010';
+    if (GM_getValue(flag, false) === true) return;
+    for (const host of ['turkseed.com', 'podzemlje.net', 'tracker.vietmediaf.store']) {
+        GM_deleteValue(keyFor(host));
+        GM_deleteValue(FAILURE_KEY_PREFIX + host);
+        GM_deleteValue(EVENT_PATH_CACHE_PREFIX + host);
+        GM_deleteValue(HOST_BUSY_KEY + host);
+        clearPendingEvents(host);
+        removeFromDemoted(host);
+        log(`[Migrate] ${host} 状态已清除，按新登录检测逻辑重探`);
+    }
+    GM_setValue(AUTO_SCAN_TIME_KEY, 0);
+    GM_setValue(flag, true);
+}
+
 function siteSets() {
     const promoted = getPromoted(), demoted = getAutoDemoted(), paused = getPausedSites();
     const active = { ...SITES };
@@ -674,6 +714,21 @@ function isTaskLocked() {
     if (Date.now() - existing.ts > TASK_LOCK_TTL) { GM_deleteValue(TASK_LOCK_KEY); return false; }
     return true;
 }
+
+// 单个站点的领取/检测忙碌标记：所有标签页共享（GM_setValue 是全局存储）。
+// 之前 cleanupStalePending() 在每个标签页都会把超过 60s 的 pending/claiming
+// 改成 timeout，导致 A 标签页正在后台领取时，B 标签页把状态洗掉；
+// 这里有活跃忙碌标记时，任何标签页都不做陈旧清理。
+const HOST_BUSY_KEY = 'pt_host_busy_v1_', HOST_BUSY_TTL = 6 * MIN;
+const markHostBusy = (host, ttl = HOST_BUSY_TTL) =>
+    GM_setValue(HOST_BUSY_KEY + host, { ts: Date.now(), ttl, owner: LOCK_OWNER });
+const unmarkHostBusy = host => GM_deleteValue(HOST_BUSY_KEY + host);
+const isHostBusy = host => {
+    const b = GM_getValue(HOST_BUSY_KEY + host, null);
+    if (!b || !b.ts) return false;
+    if (Date.now() - b.ts > (b.ttl || HOST_BUSY_TTL)) { GM_deleteValue(HOST_BUSY_KEY + host); return false; }
+    return true;
+};
 
 window.addEventListener('beforeunload', () => {
     if (isAutoScanRunning || isSequentialRunning) {
@@ -1035,6 +1090,7 @@ async function loadEventPage(fetcher, url, host, opts) {
     let res;
     try { res = await fetcher(url, opts); }
     catch (e) { return { netError: e }; }
+    if (loginRedirected(res)) return { status: authResult('会话已过期，需要重新登录') };
     if (res.status === 429) return { status: { status: 'failed', message: '请求被限速 (429)', rateLimited: true } };
     if (res.status === 404) return { status: { status: 'inactive', message: '详情页不存在 (404)' } };
     if (res.status >= 500) return { status: { status: 'maintenance', message: `服务器错误 (HTTP ${res.status})` } };
@@ -1043,6 +1099,7 @@ async function loadEventPage(fetcher, url, host, opts) {
         return { status: { status: 'skip', message: '详情页被重定向到后台' } };
     }
     const html = await res.text();
+    if (looksLikeLoginHtml(html)) return { status: authResult('会话已过期，需要重新登录') };
     const bad = classifyHtml(html);
     if (bad) return { status: bad };
     if (html.includes('scratch-card-component') || html.includes('scratch-card-root')) {
@@ -1199,13 +1256,12 @@ function probeErrorToStatus(e) {
 // ==========================================
 /** 统一校验响应：重定向登录 / 4xx-5xx / 维护页 → {status}；正常 → {html} */
 async function readPage(res, path) {
-    if (res.redirected && /\/(login|auth|signin)/i.test(new URL(res.finalUrl || res.url).pathname)) {
-        return { status: { status: 'auth', message: '会话已过期' } };
-    }
+    if (loginRedirected(res)) return { status: authResult('会话已过期，需要重新登录') };
     const httpBad = httpStatusToResult(res, { auth: true });
     if (httpBad) return { status: httpBad };
     if (!res.ok) return { status: { status: 'failed', message: `GET ${path} → HTTP ${res.status}` } };
     const html = await res.text();
+    if (looksLikeLoginHtml(html)) return { status: authResult('会话已过期，需要重新登录') };
     const bad = classifyHtml(html);
     if (bad) return { status: bad };
     return { html };
@@ -1214,7 +1270,11 @@ async function readPage(res, path) {
 /** 列表页 → {result}（有今日活动）/ {list,doc}（无活动，doc 供上层继续找线索）/ {error} */
 async function probeEventsList(base, host, path) {
     let res;
-    try { res = await robustFetch(`${base}${path}`, host === 'jme-reunit3d.de' ? { timeout: 40000 } : {}); }
+    // 常规站点：单次 7s、最多 2 次、短退避；最坏 ~15s，不会吃满 20s 探测预算。
+    // jme-reunit3d.de 已知极慢，保留原来的 40s 长超时。
+    const slowHost = host === 'jme-reunit3d.de';
+    const fetchOpts = slowHost ? { timeout: 40000 } : { timeout: 7000, fastRetry: true };
+    try { res = await robustFetch(`${base}${path}`, fetchOpts, 0, slowHost ? 3 : 2); }
     catch (e) { return { error: probeErrorToStatus(e) }; }
     const page = await readPage(res, path);
     if (page.status) return { error: page.status };
@@ -1226,7 +1286,8 @@ async function probeEventsList(base, host, path) {
 
 /** 详情页探测（可选后台直领）：三个调用分支共用 */
 async function probeDetail(base, host, path, { directClaim = false, cacheSource = null } = {}) {
-    const detail = await loadEventPage((u, o) => robustFetch(u, o), `${base}${path}`, host);
+    const detail = await loadEventPage((u, o) => robustFetch(u, o, 0, 2), `${base}${path}`, host,
+        host === 'jme-reunit3d.de' ? { timeout: 40000 } : { timeout: 7000, fastRetry: true });
     if (detail.netError) return { status: 'failed', message: 'fetch 详情页超时', eventPath: path };
     if (detail.httpError) return { status: 'failed', message: `GET ${path} → HTTP ${detail.httpStatus}`, eventPath: path };
     if (detail.status) return { ...detail.status, eventPath: path };
@@ -1547,11 +1608,12 @@ async function _autoDetectRewardPathInner() {
     let res;
     try { res = await robustFetch(`${base}/events`, { credentials: 'include' }, 10000, 2); }
     catch (e) { return null; }
-    if (looksLikeLoginResponse(res)) return { needLogin: true };
+    if (loginRedirected(res)) return { needLogin: true };
     const httpBad = httpStatusToResult(res);
     if (httpBad) return httpBad;
     if (!res.ok) return null;
     const html = await res.text();
+    if (looksLikeLoginHtml(html)) return { needLogin: true };
     const bad = classifyHtml(html);
     if (bad) return bad.status === 'auth' ? { needLogin: true } : bad;
     const doc = new DOMParser().parseFromString(html, 'text/html');
@@ -1873,10 +1935,11 @@ async function navigateToInfinityHDEventPage() {
         let res;
         try { res = await robustFetch(`${base}/`, { credentials: 'include' }, FETCH_TIMEOUT, 2); }
         catch (e) { return { status: 'failed', message: e.name === 'AbortError' ? '请求超时' : `网络错误：${e.message || e}` }; }
-        if (looksLikeLoginResponse(res)) return authResult();
+        if (loginRedirected(res)) return authResult();
         const httpBad = httpStatusToResult(res, { notFound: false });
         if (httpBad) return httpBad;
         const html = await res.text();
+        if (looksLikeLoginHtml(html)) return authResult();
         const bad = classifyHtml(html);
         if (bad) return bad;
         links = findLinks(new DOMParser().parseFromString(html, 'text/html'));
@@ -2475,10 +2538,15 @@ function checkDailyReset() {
 }
 
 function cleanupStalePending() {
+    // 有任务锁说明某个标签页正在跑扫描/串行领取；此时任何 pending/claiming
+    // 都可能是它刚打开的后台 tab 正在处理，绝不能在这里改写。
+    if (isTaskLocked()) return;
     const now = Date.now();
     for (const h of Object.keys(ALL_KNOWN_SITES)) {
         const s = GM_getValue(keyFor(h), null);
         if (!s || !s.ts) continue;
+        // 单个站点有活跃忙碌标记（用户点重试 / withTab 正在等待）时也跳过。
+        if (isHostBusy(h)) continue;
         if ((s.status === 'pending' || s.status === 'claiming') && (now - s.ts) > STALE_PENDING_MS) {
             setSiteStatus(h, { status: 'timeout', message: `陈旧状态清理（${Math.round((now - s.ts) / 1000)}s）` });
         }
@@ -2642,10 +2710,15 @@ function maybeAutoScan() {
 async function withTab(host, url, timeout, tabKey = host) {
     // 优化：强制静默打开标签页
     const isAuto = isAutoOpenedTab() || location.hash === CLAIM_HASH || location.hash === DETECT_HASH;
-    openTabQ(tabKey, url, !isAuto);
-    await waitForSiteDone(host, timeout);
-    closeTab(tabKey);
-    return getSiteStatus(host);
+    markHostBusy(host, Math.max(timeout || SEQUENTIAL_TIMEOUT, 60 * 1000) + 60 * 1000);
+    try {
+        openTabQ(tabKey, url, !isAuto);
+        await waitForSiteDone(host, timeout);
+        return getSiteStatus(host);
+    } finally {
+        closeTab(tabKey);
+        unmarkHostBusy(host);
+    }
 }
 
 async function runPumpkinTab(host, { active = false, waitMs = 20000 } = {}) {
@@ -2726,6 +2799,15 @@ async function startAutoScan(isAuto = false) {
             await withTab(host, buildClaimUrl(host), SEQUENTIAL_TIMEOUT);
             if (i < claimTargets.length - 1) await sleep(AUTO_SCAN_CFG.intervalBetween);
         }
+        // 扫描结束后统一提醒所有未登录站点，而不是只在单个站点状态里显示
+        const authHosts = allTargets.filter(h =>
+            (probeResults[h] && probeResults[h].status === 'auth') || getSiteStatus(h).status === 'auth');
+        if (authHosts.length) {
+            const shown = authHosts.slice(0, 4).join('、') + (authHosts.length > 4 ? ` 等 ${authHosts.length} 个` : '');
+            const msg = `🔒 有 ${authHosts.length} 个站点未登录：${shown}`;
+            log(`[Scan] ${msg}（完整列表：${authHosts.join('、')}）`);
+            showToast(msg);
+        }
         log(`[Scan] 完成：总计 ${allTargets.length}，开 tab 领取 ${claimTargets.length}，特殊 tab 探测 ${needTabHosts.length}`);
     } finally {
         isAutoScanRunning = false;
@@ -2748,14 +2830,19 @@ async function runSequential(hosts, { taskName, activeTab, pendingMessage, state
     try {
         for (let i = 0; i < hosts.length; i++) {
             const host = hosts[i];
+            markHostBusy(host, SEQUENTIAL_TIMEOUT + 60 * 1000);
             setSiteStatus(host, { status: 'pending', message: pendingMessage });
-            // 优化：强制静默打开
-            openTabQ(host, buildClaimUrl(host), activeTab);
-            const result = await waitForSiteDone(host);
-            if (result.status === 'timeout' && !isTerminal(getSiteStatus(host))) {
-                setSiteStatus(host, { status: 'timeout', message: result.message || '超时' });
+            try {
+                // 优化：强制静默打开
+                openTabQ(host, buildClaimUrl(host), activeTab);
+                const result = await waitForSiteDone(host);
+                if (result.status === 'timeout' && !isTerminal(getSiteStatus(host))) {
+                    setSiteStatus(host, { status: 'timeout', message: result.message || '超时' });
+                }
+            } finally {
+                closeTab(host);
+                unmarkHostBusy(host);
             }
-            closeTab(host);
             if (host === 'yu-scene.net') {
                 await sleep(SEQUENTIAL_GAP);
                 const wheelSt = getSiteStatus(host);
@@ -2914,11 +3001,19 @@ async function openYusceneTab(mode) {
     closeTab(tabKey);
 }
 function retryHost(host) {
+    // 用户手动重试也会开后台 tab；加忙碌标记，避免其他标签页的陈旧清理
+    // 在 tab 还没加载完之前把状态改成 timeout。
+    markHostBusy(host);
+    const started = Date.now();
     setSiteStatus(host, { status: 'pending', message: '等待重试...' });
     openTabQ(host, buildClaimUrl(host));
     if (host === 'yu-scene.net' && pumpkinRetryable()) {
         openTabQ(host + '#pumpkin', buildClaimUrl(host, 'pumpkin'));
     }
+    waitFor(() => {
+        const st = getSiteStatus(host);
+        return (isSettled(st) && st.ts > started) || Date.now() - started >= HOST_BUSY_TTL;
+    }, HOST_BUSY_TTL, 500).then(() => unmarkHostBusy(host));
 }
 async function checkHost(host) {
     setSiteStatus(host, { status: 'pending', message: '等待检测...' });
@@ -3244,6 +3339,12 @@ function renderStats() {
         } else {
             parts.push(spinSummaryHtml('FileList Spin', GM_getValue(FILELIST_SPIN_NEXT_KEY, 0)));
         }
+        // 未登录站点常驻提醒：扫描结束后依然能看到，不用逐条翻表格
+        const authHosts = hosts.filter(h => getSiteStatus(h).status === 'auth');
+        if (authHosts.length) {
+            const shown = authHosts.slice(0, 6).join('、') + (authHosts.length > 6 ? '…' : '');
+            parts.push(` · <span style="color:#ff8a80">🔒 未登录 ${authHosts.length}：${escapeHtml(shown)}</span>`);
+        }
         sum.innerHTML = `活跃进度：${done} / ${hosts.length} （${Math.round(pct)}%）${running}${scanning}${scanInfo}${parts.join('')}`;
     }
     const badge = document.getElementById('pt-active-badge');
@@ -3423,6 +3524,7 @@ async function main() {
     checkDailyReset();
     migrateRenamedSites();
     migrateResumedSites();
+    migrateAuthDetection();
     cleanupStalePending();
     maybeClearStaleLock();
     startSpinTimers();

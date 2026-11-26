@@ -5,7 +5,7 @@
 
 > 多站点 PT 每日奖励控制面板 —— 一个 Tampermonkey 用户脚本，把几十个 PT 站的每日签到、转盘、活动礼物收进同一个面板里批量领取。
 
-![version](https://img.shields.io/badge/version-11.0.9-blue)
+![version](https://img.shields.io/badge/version-11.0.10-blue)
 ![license](https://img.shields.io/badge/license-GPL--3.0-green)
 ![platform](https://img.shields.io/badge/platform-Tampermonkey-orange)
 
@@ -223,6 +223,13 @@ const SITE_PAUSED = {
 菜单里的「🌐 切换网络日志 hook」会把站点自身请求也记进来，排查完记得关掉，否则日志会被站点自身的轮询刷满。
 
 ## 更新日志
+
+### 11.0.10
+- 强化登录态识别：同时检查重定向目标路径与页面 HTML（含土耳其语 `Hesap Giriş` 等本地化登录页），`turkseed.com`、`podzemlje.net`、`tracker.vietmediaf.store` 等站点未登录时不再被误判为「活动列表为空」或拖到超时，统一归类为 `auth`
+- 「立即扫描全部」结束后统一弹出未登录汇总提醒，并在面板顶部常驻显示未登录站点数量与名单
+- 探测阶段改用短超时 + 短退避重试（常规站点单次 7 秒、最多 2 次），慢站点不再把 20 秒探测预算耗在限速 sleep 上；`jme-reunit3d.de` 保留长超时
+- 新增跨标签页「站点忙碌锁」：`withTab`、手动重试、串行领取期间，其他标签页不会再把 `pending/claiming` 误清理成 `timeout`，解决 `tracker.vietmediaf.store` 领取被拖慢数分钟的问题
+- CDN 资源版本号同步更新为 `?v=11.0.10`
 
 ### 11.0.9
 - 修复用户手动打开 `seedcore.net` / `czteam.me` 首页时被自动领取并关闭标签页的问题：领取和自动关闭现在只对脚本自己打开的标签生效（以初次加载时的 `#pt-claim` / `#pt-detect` / `#pt-pumpkin` 标记为依据），用户浏览器打开的页面由用户控制
