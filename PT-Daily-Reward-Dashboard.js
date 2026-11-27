@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         PT Daily Reward Dashboard
 // @namespace    http://tampermonkey.net/
-// @version      11.0.10
-// @description  多站点 PT 每日奖励控制面板；支持同站点多活动连续领取；极速后台静默领取；多特殊转盘支持；修复 seedpool 隐藏报错及误报成功；新增 polishtorrent/myfunzone/yu-scene 的 /events + 特殊玩法双分支；集成 V11 优化：防风控重试、CDN 兜底、悬浮球 Badge、后台静默、单站日志与插件化重构；torrenthaven.org 已并入 infinityhd.net，移除该旧域名；v3x.club 改用独立 API handler，签到与转盘直接请求 api.v3x.club，不再跳转 /events；CDN 资源链接加版本号绕过 jsDelivr 分支缓存；oldtoons.world 已恢复，移除维护暂停并清除遗留状态；修复用户手动打开 seedcore/czteam 首页被自动领取并关闭标签页的问题；强化多语言登录页/重定向识别，未登录站点统一归类 auth 并在扫描结束后汇总提醒；缩短探测重试退避并为领取中的站点加跨标签页忙碌锁，避免慢站点被陈旧状态清理打断
+// @version      11.0.11
+// @description  多站点 PT 每日奖励控制面板；支持同站点多活动连续领取；极速后台静默领取；多特殊转盘支持；修复 seedpool 隐藏报错及误报成功；新增 polishtorrent/myfunzone/yu-scene 的 /events + 特殊玩法双分支；集成 V11 优化：防风控重试、CDN 兜底、悬浮球 Badge、后台静默、单站日志与插件化重构；torrenthaven.org 已并入 infinityhd.net，移除该旧域名；v3x.club 改用独立 API handler，签到与转盘直接请求 api.v3x.club，不再跳转 /events；CDN 资源链接加版本号绕过 jsDelivr 分支缓存；oldtoons.world 已恢复，移除维护暂停并清除遗留状态；修复用户手动打开 seedcore/czteam 首页被自动领取并关闭标签页的问题；强化多语言登录页/重定向识别，未登录站点统一归类 auth 并在扫描结束后汇总提醒；缩短探测重试退避并为领取中的站点加跨标签页忙碌锁，避免慢站点被陈旧状态清理打断；新增 shadow.vip3ra.org 每日礼物 handler，自动读取 CSRF Token 调用 /daily-gift/claim，并从响应 message 中提取奖励数量
 // @author       Whale, DeepSeek
 // @license      GPL-3.0 License
 // @match        https://bitporn.eu/*
@@ -66,12 +66,13 @@
 // @match        https://f1carreras.xyz/*
 // @match        https://filelist.io/*
 // @match        https://v3x.club/*
+// @match        https://shadow.vip3ra.org/*
 // @icon         https://cdn.jsdelivr.net/gh/twitter/twemoji@master/assets/svg/1f381.svg
-// @resource     pt_css        https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/dashboard.css?v=11.0.10
-// @resource     pt_html       https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/dashboard.html?v=11.0.10
-// @resource     pt_sites      https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/sites.json?v=11.0.10
-// @resource     pt_inactive   https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/inactive.json?v=11.0.10
-// @resource     pt_timezone   https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/timezone.json?v=11.0.10
+// @resource     pt_css        https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/dashboard.css?v=11.0.11
+// @resource     pt_html       https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/dashboard.html?v=11.0.11
+// @resource     pt_sites      https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/sites.json?v=11.0.11
+// @resource     pt_inactive   https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/inactive.json?v=11.0.11
+// @resource     pt_timezone   https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/timezone.json?v=11.0.11
 // @grant        GM_getResourceText
 // @grant        GM_openInTab
 // @grant        GM_setValue
@@ -83,7 +84,7 @@
 // @grant        GM_xmlhttpRequest
 // @grant        window.close
 // @grant        unsafeWindow
-// @require      https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/pt-core.js?v=11.0.10
+// @require      https://cdn.jsdelivr.net/gh/linlikun/PT-Daily-Reward-Dashboard@main/dist/pt-core.js?v=11.0.11
 // @run-at       document-idle
 // @noframes
 // @connect      *
@@ -184,6 +185,8 @@ const SITE_OVERRIDES = {
     'torrenthaven.org': null,
     // v3x.club 没有 /events：签到与转盘走独立 API handler，避免 CDN 旧配置把它带回 unit3d
     'v3x.club': { handler: 'v3x' },
+    // shadow.vip3ra.org 的每日礼物是左下角悬浮按钮 + POST /daily-gift/claim，没有 /events
+    'shadow.vip3ra.org': { handler: 'shadowgift' },
 };
 // 维护中站点：until 之前完全不探测（不占扫描时间、不计失败），到期自动回到常规探测
 // oldtoons.world 2026-11-24 已恢复正常（活动页可领取），移除维护暂停并恢复常规扫描
@@ -1361,6 +1364,80 @@ async function v3xProbe() {
 // v3x 的「探针」与「领取」是同一件事：直接 POST 两个 API，不需要开 tab / 访问 /events
 const claimOnV3x = guardLogin(v3xProbe);
 
+// ---- ShadoW（shadow.vip3ra.org）每日礼物 ----
+// 站点页面左下角有 🎁 悬浮按钮，点击后 POST /daily-gift/claim。
+// 响应 JSON 只有 { success, message }，具体数量藏在 message 里
+// （例如 "You received 161 bonus points!"），没有独立的数字字段。
+async function shadowGiftCsrf() {
+    let res;
+    try { res = await robustFetch('https://shadow.vip3ra.org/rules', { timeout: 7000, fastRetry: true }, 0, 2); }
+    catch (e) { return { error: `获取页面失败：${e.message || e}` }; }
+    if (loginRedirected(res)) return { auth: true };
+    if (!res.ok) return { error: `GET /rules → HTTP ${res.status}` };
+    const html = await res.text();
+    if (looksLikeLoginHtml(html)) return { auth: true };
+    const m = html.match(/<meta\s+name=["']csrf-token["']\s+content=["']([^"']+)["']/i)
+           || html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+name=["']csrf-token["']/i);
+    return m ? { token: m[1] } : { error: '页面未找到 CSRF Token' };
+}
+function shadowGiftAmount(data, message) {
+    for (const k of ['reward', 'points', 'amount', 'bonus', 'value', 'bonusPoints', 'bonus_points']) {
+        const v = data && data[k];
+        if (typeof v === 'number' && Number.isFinite(v)) return v;
+        if (typeof v === 'string' && /^\s*\d[\d,]*\s*$/.test(v)) return Number(v.replace(/,/g, ''));
+    }
+    // 站点当前只返回 message，从 "You received 161 bonus points!" 里取数字
+    const m = String(message || '').replace(/,/g, '').match(/\b(\d+)\b/);
+    return m ? Number(m[1]) : null;
+}
+async function shadowGiftProbe() {
+    const post = token => robustFetch('https://shadow.vip3ra.org/daily-gift/claim', {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'X-CSRF-TOKEN': token,
+            'Origin': 'https://shadow.vip3ra.org',
+            'Referer': 'https://shadow.vip3ra.org/rules',
+        },
+        data: '',
+        timeout: 10000,
+    }, 0, 2);
+    try {
+        let csrf = await shadowGiftCsrf();
+        if (csrf.auth) return authResult('会话已过期，需要重新登录');
+        if (csrf.error) return { status: 'failed', message: csrf.error };
+        let res = await post(csrf.token);
+        // 419/403 多半是 Token 过期，重新取一次再试
+        if (res.status === 419 || res.status === 403) {
+            csrf = await shadowGiftCsrf();
+            if (csrf.auth) return authResult('会话已过期，需要重新登录');
+            if (!csrf.error) res = await post(csrf.token);
+        }
+        if (loginRedirected(res)) return authResult('会话已过期，需要重新登录');
+        if (res.status === 401 || res.status === 403) return authResult('会话已过期，需要重新登录');
+        let data = null;
+        try { const t = (await res.text()).trim(); if (t) data = JSON.parse(t); } catch (e) {}
+        const message = String((data && data.message) || '').trim();
+        if (data && data.success === true) {
+            const n = shadowGiftAmount(data, message);
+            return { status: 'claimed', message: `每日礼物：${n !== null ? `+${n} 魔力` : (message || '领取成功')}` };
+        }
+        if (res.status >= 500) return { status: 'maintenance', message: `服务器错误 (HTTP ${res.status})` };
+        if (!res.ok) return { status: 'failed', message: `领取失败 (HTTP ${res.status})${message ? '：' + message : ''}` };
+        if (data && data.success === false) {
+            if (/already|claimed|tomorrow|next time|今日|已领|已经/i.test(message)) {
+                return { status: 'already', message: `每日礼物：${message || '今日已领'}` };
+            }
+            return { status: 'skip', message: `每日礼物：${message || '今日无礼物'}` };
+        }
+        return { status: 'failed', message: `无法解析领取响应${message ? '：' + message : ''}` };
+    } catch (e) { return { status: 'failed', message: `异常：${e.message || e}` }; }
+}
+// 与 v3x 一样：探针即领取，不依赖开 tab 或 /events 页面
+const claimOnShadowGift = guardLogin(shadowGiftProbe);
+
 /** filelist 冷却文本 → 下次可转时间戳（探针与领取共用） */
 function filelistCooldownTs(text) {
     const m = text.match(/Please check back again in\s*(?:(\d+)h\s*)?(?:(\d+)m\s*)?(?:(\d+)s)?/i);
@@ -1458,6 +1535,7 @@ async function seedcoreProbe() {
 
 const SITE_PROBES = {
     'v3x.club': v3xProbe,
+    'shadow.vip3ra.org': shadowGiftProbe,
     'dirtybytes.net': DIRTYBYTES_STATUS,
     'filelist.io': filelistProbe,
     'myfunzone.org': async () => (await probeEventsPage('myfunzone.org', 'https://myfunzone.org')) || myfunzoneWheelProbe(),
@@ -2478,6 +2556,7 @@ const claimOnPolishTorrentWheel = guardLogin(async () => {
 // 优化：将站点领取逻辑插件化
 const SITE_HANDLERS = {
     v3x: claimOnV3x,
+    shadowgift: claimOnShadowGift,
     czteam: claimOnCzTeam,
     seedcore: claimOnSeedCore,
     retrotoon: claimOnRetroToon,

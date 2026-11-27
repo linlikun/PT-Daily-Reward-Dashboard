@@ -1,15 +1,12 @@
-[Uploading README.md…]()
-[README.md](https://github.com/user-attachments/files/35093775/README.md)
-
 # PT Daily Reward Dashboard
 
 > 多站点 PT 每日奖励控制面板 —— 一个 Tampermonkey 用户脚本，把几十个 PT 站的每日签到、转盘、活动礼物收进同一个面板里批量领取。
 
-![version](https://img.shields.io/badge/version-11.0.10-blue)
+![version](https://img.shields.io/badge/version-11.0.11-blue)
 ![license](https://img.shields.io/badge/license-GPL--3.0-green)
 ![platform](https://img.shields.io/badge/platform-Tampermonkey-orange)
 
-支持 **57 个站点**，覆盖 Unit3D 系活动页、以及十余个有独立玩法的站点（转盘、签到、南瓜、抽奖）。所有领取都在后台静默完成，不抢焦点、不打断你正在做的事。
+支持 **58 个站点**，覆盖 Unit3D 系活动页、以及十余个有独立玩法的站点（转盘、签到、南瓜、抽奖）。所有领取都在后台静默完成，不抢焦点、不打断你正在做的事。
 
 ---
 
@@ -93,13 +90,14 @@ Tampermonkey 菜单里还有几个排查用的开关：
 
 ## 支持的站点
 
-按处理器分为 13 类，共 57 个站点：
+按处理器分为 14 类，共 58 个站点：
 
 | 处理器 | 站点数 | 说明 |
 |---|---|---|
 | `unit3d` | 45 | Unit3D 系标准活动页（`/events`） |
 | `infinityhd` | 1 | InfinityHD 定制活动页 |
 | `v3x` | 1 | V3X：签到 + 转盘直接调用 `api.v3x.club` |
+| `shadowgift` | 1 | ShadoW：每日礼物 API（从 message 中提取奖励数量） |
 | `digitalcore` | 1 | DigitalCore 积分签到 |
 | `dirtybytes` | 1 | DirtyBytes 每日连续签到 |
 | `czteam` | 1 | CZTeam 每日礼物 |
@@ -117,8 +115,8 @@ Tampermonkey 菜单里还有几个排查用的开关：
 **Unit3D 系（45）**
 3dvault.org · bitporn.eu · capybarabr.com · clearjav.com · darkpeers.org · dreadvault.org · eiga.moi · emu-warez.com · f1carreras.xyz · gemini-tracker.org · generation-free.org · hd-united.vn · hellenic-hd.cc · homiehelpdesk.net · immortuos.life · itatorrents.xyz · jme-reunit3d.de · lat-team.com · luminarr.me · malayabits.cc · midnightscene.cc · nirvana.li · nordicq.org · oldtoons.world · onlyencodes.cc · podzemlje.net · portugas.org · rastastugan.org · reelflix.cc · retro-movies.club · samaritano.cc · seedpool.org · sextorrent.myds.me · shareisland.org · skipthecommercials.xyz · torrent.desi · torrenteros.org · torrentland.li · tracker.milnueve.cc · tracker.teamflix.cc · tracker.vietmediaf.store · turkseed.com · upload.cx · upscalevault.com · znth.cx
 
-**独立玩法（12）**
-0dayfiles.net · czteam.me · digitalcore.club · dirtybytes.net · filelist.io · infinityhd.net · myfunzone.org · polishtorrent.top · retrotoon.world · seedcore.net · v3x.club · yu-scene.net
+**独立玩法（13）**
+0dayfiles.net · czteam.me · digitalcore.club · dirtybytes.net · filelist.io · infinityhd.net · myfunzone.org · polishtorrent.top · retrotoon.world · seedcore.net · shadow.vip3ra.org · v3x.club · yu-scene.net
 
 </details>
 
@@ -223,6 +221,12 @@ const SITE_PAUSED = {
 菜单里的「🌐 切换网络日志 hook」会把站点自身请求也记进来，排查完记得关掉，否则日志会被站点自身的轮询刷满。
 
 ## 更新日志
+
+### 11.0.11
+- 新增 `shadow.vip3ra.org` 每日礼物支持：自动从页面读取 CSRF Token 并 POST `/daily-gift/claim`，Token 过期会自动刷新重试
+- 站点 JSON 没有独立的数量字段，奖励数量从响应 message（如 `You received 161 bonus points!`）中提取；若站点以后增加 `reward` / `points` 等字段会优先使用
+- 今日已领、未登录、419 Token 过期、服务器错误等响应分别归类为 `already` / `auth` / `failed` / `maintenance`
+- 站点已加入活跃表与脚本 `@match`，CDN 资源版本号同步为 `?v=11.0.11`
 
 ### 11.0.10
 - 强化登录态识别：同时检查重定向目标路径与页面 HTML（含土耳其语 `Hesap Giriş` 等本地化登录页），`turkseed.com`、`podzemlje.net`、`tracker.vietmediaf.store` 等站点未登录时不再被误判为「活动列表为空」或拖到超时，统一归类为 `auth`
